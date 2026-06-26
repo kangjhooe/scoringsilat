@@ -140,9 +140,15 @@ function EventLanding({ slug, eventSeed }) {
           <h1 className="max-w-4xl text-4xl font-extrabold uppercase leading-none md:text-7xl" data-testid="event-landing-title">
             {event.landing_title || event.name}
           </h1>
-          <p className="mt-4 max-w-2xl text-base leading-7 text-zinc-200 md:text-lg">{event.landing_subtitle || event.landing_description}</p>
-          {event.landing_description && (
-            <p className="mt-3 max-w-2xl text-sm leading-6 text-zinc-300">{event.landing_description}</p>
+          {event.landing_subtitle || event.landing_description ? (
+            <>
+              <p className="mt-4 max-w-2xl text-base leading-7 text-zinc-200 md:text-lg">{event.landing_subtitle || event.landing_description}</p>
+              {event.landing_description && (
+                <p className="mt-3 max-w-2xl text-sm leading-6 text-zinc-300">{event.landing_description}</p>
+              )}
+            </>
+          ) : (
+            <p className="mt-4 max-w-2xl text-base leading-7 text-zinc-400">Informasi event akan segera tersedia. Silakan hubungi panitia untuk detail lebih lanjut.</p>
           )}
 
           <div className="mt-7 flex flex-wrap gap-3">
