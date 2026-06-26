@@ -1,0 +1,7 @@
+tunnel: YOUR_TUNNEL_ID_OR_NAME
+credentials-file: /root/.cloudflared/YOUR_TUNNEL_ID.json
+
+ingress:
+  - hostname: silat.smkisnu.sch.id
+    service: http://127.0.0.1:18080
+  - service: http_status:404

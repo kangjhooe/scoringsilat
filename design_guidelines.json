@@ -1,0 +1,96 @@
+{
+  "project_name": "Pencak Silat Real-time Scoring App",
+  "theme": "DARK",
+  "archetype": "2 (Performance Pro)",
+  "vibe": "Tactical Minimalism, authoritative broadcast scoreboard, high-energy athletic, precision control room",
+  "colors": {
+    "background": "#0A0A0A",
+    "surface": "#141414",
+    "surface_glass": "rgba(20, 20, 20, 0.7)",
+    "border": "#27272A",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A1A1AA",
+    "red_corner": {
+      "base": "#DC2626",
+      "bright": "#FF3B30",
+      "surface": "rgba(220, 38, 38, 0.15)",
+      "border": "rgba(255, 59, 48, 0.5)"
+    },
+    "blue_corner": {
+      "base": "#2563EB",
+      "bright": "#007AFF",
+      "surface": "rgba(37, 99, 235, 0.15)",
+      "border": "rgba(0, 122, 255, 0.5)"
+    },
+    "accent_timer": "#FFCC00",
+    "success": "#10B981"
+  },
+  "typography": {
+    "primary_font": "Inter",
+    "display_font": "Bebas Neue",
+    "fallback_font": "sans-serif",
+    "rules": {
+      "headings": "Use Bebas Neue for all score numbers, timers, and athlete names on the public broadcast display. Tracking must be tight (`tracking-tighter`).",
+      "body": "Use Inter for operator dashboards, rules configuration, and standard tabular data.",
+      "hierarchy": {
+        "h1": "text-5xl sm:text-6xl tracking-tighter uppercase",
+        "h2": "text-3xl sm:text-4xl tracking-tight uppercase",
+        "h3": "text-xl sm:text-2xl font-bold",
+        "body": "text-base leading-relaxed text-zinc-300",
+        "small_labels": "text-xs tracking-[0.2em] uppercase text-zinc-400"
+      }
+    }
+  },
+  "layout_strategy": {
+    "spacing_scale": "Generous spacing for dashboards (p-6 to p-8 inner padding).",
+    "grid_modes": {
+      "dashboard_operator": "MODE B: 'CONTROL ROOM'. grid-cols-1 md:grid-cols-4 lg:grid-cols-12 gap-4 or gap-6. Dense, data-heavy, full height columns. Flat solid surfaces.",
+      "tablet_jury": "Split-screen layout (Red vs Blue). Massive tap targets for point inputs (+1, +2, +3). Use 50vh minimum for the tap areas. No complex navigation on screen.",
+      "public_display": "Minimal persistent compact bar or focused center layout. Black or dark textured background. Highest contrast possible. Large sans-serif text, state-driven color cues (Red/Blue)."
+    },
+    "surfaces": "Use 'Tactical Minimalism'. Flat solid backgrounds for health/scores. 1px solid borders (`border-white/10`). Avoid soft shadows; use 1px inner highlights if necessary."
+  },
+  "components": {
+    "buttons": "Shadcn based. Use primary colors (Red/Blue/Accent) only for crucial actions. All jury buttons MUST have a minimum height of `h-20` or `h-24` for rapid tapping.",
+    "cards": "Cardless or sharp rectangular edges. Maximum 4px border-radius (`rounded-sm`).",
+    "tables": "Shadcn tables. Dense. 1px subtle borders (`border-white/10`).",
+    "inputs": "Shadcn forms with heavy customization. Focus states must have `ring-2 ring-white/50`.",
+    "public_scoreboard": "Custom HTML/Tailwind. Absolute positioning or CSS Grid for precise broadcast layout."
+  },
+  "motion_and_interactions": {
+    "hover_states": "Hover states must explicitly set `text-white` and use a lighter background hue.",
+    "active_states": "Buttons must physically press down (`active:translate-y-1`) for tactile feedback.",
+    "transitions": "Fast and snappy. `transition-all duration-150 ease-out`.",
+    "public_display_animations": "Subtle entry animations. Score changes should pulse briefly."
+  },
+  "icons": "lucide-react",
+  "image_urls": {
+    "public_display_background": {
+      "url": "https://images.unsplash.com/photo-1585314062340-f1a5a7c9328d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxOTF8MHwxfHNlYXJjaHwyfHxkYXJrJTIwYWJzdHJhY3QlMjB0ZXh0dXJlJTIwYmFja2dyb3VuZHxlbnwwfHx8fDE3ODA3NTk3Mzl8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Dark textured plaster wall. Use as a low-opacity background for the Public Display to break up the flat black."
+    },
+    "indonesia_cultural_texture": {
+      "url": "https://images.unsplash.com/photo-1761515315375-1315503bb3ce?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODd8MHwxfHNlYXJjaHwyfHxpbmRvbmVzaWElMjBiYXRpayUyMHBhdHRlcm58ZW58MHx8fHwxNzgwODk3NDQ5fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Traditional batik pattern. Use as a very subtle overlay (opacity 5-10%) masked behind athlete sections or headers to give an Indonesian signature."
+    },
+    "silhouette_decoration": {
+      "url": "https://images.unsplash.com/photo-1476525223214-c31ff100e1ae?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxOTB8MHwxfHNlYXJjaHwxfHxtYXJ0aWFsJTIwYXJ0cyUyMHNpbGhvdWV0dGV8ZW58MHx8fHwxNzgwODk3NDQ5fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Martial arts silhouette. Can be used in empty states or loading screens."
+    }
+  },
+  "accessibility_and_testing": {
+    "contrast": "Ensure APCA/WCAG AA contrast. Especially white text on the Red/Blue corner backgrounds.",
+    "testing_attributes": "All interactive elements (buttons, score inputs, tabs) MUST include `data-testid` (e.g., `data-testid=\"red-score-button-1\"`)."
+  },
+  "instructions_to_main_agent": [
+    "You are building a Pencak Silat real-time scoring application using React, Tailwind, and Shadcn UI. The interface is Bahasa Indonesia.",
+    "Ensure `data-testid` is added to all interactive elements, matching kebab-case, role-based naming.",
+    "This is an athletic, high-stakes application. Do not use generic SaaS look. Use tactical, dark mode styling (Archetype 2: Performance Pro).",
+    "Jury Tablet view must have massive, highly clickable tap areas for scoring. No small icons.",
+    "Public display must emulate Olympic-grade broadcast scoreboards: massive typography (Bebas Neue), persistent compact layout, high contrast, state-driven color cues.",
+    "Strictly adhere to the Red (Sudut Merah) vs Blue (Sudut Biru) visual separation. These are non-negotiable identities for the athletes.",
+    "All score rules/points must be data-driven, do not hardcode the points logic deeply into the UI.",
+    "Implement WebSockets (mocked if backend unavailable) for real-time score streaming.",
+    "Do not use generic transparent headers over content without a solid background or heavy backdrop-blur."
+  ]
+}
