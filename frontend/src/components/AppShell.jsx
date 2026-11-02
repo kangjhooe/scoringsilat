@@ -3,7 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { LogOut, Shield, Tv, Users, ClipboardList, Gavel, Timer, Trophy, MessageSquare, ScrollText, GitBranch, Menu } from "lucide-react";
+import { LogOut, Shield, Tv, Users, ClipboardList, Gavel, Timer, Trophy, MessageSquare, ScrollText, GitBranch, Medal, Menu } from "lucide-react";
 
 const ROLE_LABEL = {
   admin: "Administrator",
@@ -25,6 +25,7 @@ export default function AppShell({ children, title }) {
     { to: "/admin/registrations", label: "Registrasi", icon: ScrollText, roles: ["admin", "operator"] },
     { to: "/operator", label: "Pertandingan", icon: ClipboardList, roles: ["admin", "operator"] },
     { to: "/brackets", label: "Bracket", icon: GitBranch, roles: ["admin", "operator"] },
+    { to: "/medals", label: "Medali", icon: Medal, roles: ["admin", "operator"] },
     { to: "/dashboard", label: "Dashboard", icon: Trophy, roles: ["admin", "operator", "jury", "referee", "head_jury", "timer"] },
     { to: "/display", label: "Public Display", icon: Tv, roles: ["admin", "operator", "jury", "referee", "head_jury", "timer"] },
     { to: "/admin/whatsapp", label: "WhatsApp", icon: MessageSquare, roles: ["admin"] },

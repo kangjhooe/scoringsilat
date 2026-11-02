@@ -121,7 +121,7 @@ export default function WAHASettings() {
 
       <section className="mt-6 border border-white/10 rounded-sm bg-[#0f0f10] p-6 space-y-4">
         <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 flex items-center gap-2"><MessageSquare className="w-3.5 h-3.5"/> Template Pesan</div>
-        <p className="text-xs text-zinc-500">Placeholder yang didukung: <code className="text-[#ffcc00]">{"{name}"}</code>, <code className="text-[#ffcc00]">{"{event_name}"}</code>, <code className="text-[#ffcc00]">{"{registration_number}"}</code>, <code className="text-[#ffcc00]">{"{participant_number}"}</code>, <code className="text-[#ffcc00]">{"{admin_notes}"}</code>. Template ini akan dipakai pada update otomatis berikutnya.</p>
+        <p className="text-xs text-zinc-500">Placeholder yang didukung: <code className="text-[#ffcc00]">{"{name}"}</code>, <code className="text-[#ffcc00]">{"{event_name}"}</code>, <code className="text-[#ffcc00]">{"{registration_number}"}</code>, <code className="text-[#ffcc00]">{"{access_code}"}</code>, <code className="text-[#ffcc00]">{"{participant_number}"}</code>, <code className="text-[#ffcc00]">{"{admin_notes}"}</code>. Sisipkan {"{access_code}"} pada template bila pesan perlu membawa kode akses peserta.</p>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {TEMPLATE_KEYS.map((t) => (
             <div key={t.key}>

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, Link } from "react-router-dom";
 import AppShell from "@/components/AppShell";
 import api, { BACKEND_URL } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
@@ -10,7 +10,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Toaster, toast } from "sonner";
 import { resolvePhotoUrl } from "@/components/PhotoUpload";
-import { Trophy, Send, Plus, Trash2, CheckCircle2, AlertOctagon } from "lucide-react";
+import { Trophy, Send, Plus, Trash2, CheckCircle2, AlertOctagon, Tv } from "lucide-react";
 import { openMatchSocket } from "@/lib/ws";
 
 const PENALTY_CODES = [
@@ -21,6 +21,10 @@ const PENALTY_CODES = [
   { code: "jatuh", label: "Jatuh", suggest: 5 },
   { code: "lainnya", label: "Lainnya", suggest: 5 },
 ];
+
+export function seniPenaltyLabel(code) {
+  return PENALTY_CODES.find((item) => item.code === code)?.label || String(code || "Hukuman").replace(/_/g, " ");
+}
 
 export default function SeniScoring() {
   const { mid } = useParams();
@@ -60,8 +64,14 @@ export default function SeniScoring() {
 
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-4">
+          {finalized && (
+            <div className="border border-[#ffcc00]/40 bg-[#ffcc00]/5 rounded-sm px-4 py-3 text-sm text-zinc-200" data-testid="seni-locked">
+              Nilai dan hukuman terkunci setelah disahkan.
+            </div>
+          )}
           {canScore && !finalized && <JuryPanel mid={mid} summary={summary} user={user} onChanged={load} />}
           <JuryScoreList summary={summary} />
+          {summary.penalties.length > 0 && (finalized || !isHead) && <PenaltyReadOnly penalties={summary.penalties} />}
         </div>
 
         <aside className="space-y-4">
@@ -91,7 +101,12 @@ function PerformerHeader({ match, summary }) {
       <div className="flex-1 min-w-0">
         <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00]">Seni {match.discipline?.toUpperCase()}</div>
         <div className="font-display text-3xl tracking-tight mt-1 truncate">{names}</div>
-        <div className="text-xs text-zinc-400 mt-1">Match #{match.match_number} · {match.round_label}</div>
+        <div className="text-xs text-zinc-400 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span>Match #{match.match_number} · {match.round_label}</span>
+          <Link to={`/display/match/${match.id}`} target="_blank" className="text-[#ffcc00] hover:underline inline-flex items-center gap-1" data-testid="seni-public-link">
+            <Tv className="w-3.5 h-3.5"/> Layar publik
+          </Link>
+        </div>
       </div>
       <div className="text-right">
         <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-500">Skor Akhir</div>
@@ -133,7 +148,7 @@ function JuryPanel({ mid, summary, user, onChanged }) {
     <div className="border border-white/10 rounded-sm bg-[#0f0f10] p-6 space-y-5" data-testid="seni-jury-panel">
       <div>
         <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00]">Input Nilai Juri</div>
-        <div className="text-xs text-zinc-400 mt-1">Login sebagai <span className="text-white">{user.name}</span>. Nilai dapat diperbarui kapan saja sebelum difinalisasi.</div>
+        <div className="text-xs text-zinc-400 mt-1">Login sebagai <span className="text-white">{user.name}</span>. Nilai dapat diperbarui sebelum partai disahkan. Setelah disahkan, form nilai ditutup.</div>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -226,6 +241,12 @@ function ScoreSummary({ summary }) {
         <Row label="Rata-rata" value={summary.average.toFixed(2)} />
         {summary.dropped_high_low && <div className="text-[10px] text-zinc-500">Nilai tertinggi dan terendah tidak dihitung.</div>}
         <Row label="Hukuman" value={`− ${summary.total_penalty.toFixed(2)}`} accent="rose" />
+        <div className="text-[10px] text-zinc-500 leading-relaxed" data-testid="seni-jury-rule">
+          Minimal 3 juri untuk mengesahkan. Bila juri 5 atau lebih, nilai tertinggi dan terendah tidak dihitung.
+        </div>
+        {summary.jury_count < 3 && (
+          <div className="text-xs text-amber-200" data-testid="seni-jury-minimum">{summary.jury_count} dari 3 juri sudah mengirim nilai.</div>
+        )}
         <div className="border-t border-white/10 pt-2 flex items-center justify-between">
           <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00]">Nilai Akhir</div>
           <div className="font-mono-display text-2xl text-[#ffcc00]">{summary.final_score.toFixed(2)}</div>
@@ -296,10 +317,28 @@ function PenaltyPanel({ mid, summary, onChanged }) {
   );
 }
 
+function PenaltyReadOnly({ penalties }) {
+  return (
+    <div className="border border-white/10 rounded-sm bg-[#0f0f10] p-5 space-y-2" data-testid="seni-penalty-readonly">
+      <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400">Hukuman</div>
+      {penalties.map((p) => (
+        <div key={p.id} className="flex items-center justify-between text-sm gap-3">
+          <div className="min-w-0">
+            <div className="text-zinc-200 truncate">{seniPenaltyLabel(p.code)}</div>
+            {p.notes && <div className="text-xs text-zinc-500 truncate">{p.notes}</div>}
+          </div>
+          <span className="font-mono-display text-rose-300 shrink-0">−{Number(p.value).toFixed(2)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function FinalizeBox({ mid, summary, onDone }) {
   const [busy, setBusy] = useState(false);
+  const ready = summary.jury_count >= 3;
   const finalize = async () => {
-    if (!summary.jury_count) return toast.error("Belum ada nilai juri");
+    if (!ready) return toast.error("Minimal 3 juri untuk mengesahkan nilai seni");
     if (!window.confirm(`Finalisasi penilaian dengan nilai akhir ${summary.final_score.toFixed(2)}?`)) return;
     setBusy(true);
     try {
@@ -310,9 +349,13 @@ function FinalizeBox({ mid, summary, onDone }) {
     finally { setBusy(false); }
   };
   return (
-    <Button onClick={finalize} disabled={busy} className="w-full bg-[#ffcc00] hover:bg-[#e6b800] text-black uppercase tracking-[0.15em] rounded-sm" data-testid="seni-finalize-btn">
-      <CheckCircle2 className="w-4 h-4 mr-2"/>Finalisasi & Setujui
-    </Button>
+    <div className="border border-white/10 rounded-sm bg-[#0f0f10] p-4 space-y-3" data-testid="seni-finalize-box">
+      <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400">Syarat pengesahan</div>
+      <p className="text-xs text-zinc-400 leading-relaxed">Minimal 3 juri. Bila juri 5 atau lebih, nilai tertinggi dan terendah tidak dihitung.</p>
+      <Button onClick={finalize} disabled={busy || !ready} className="w-full bg-[#ffcc00] hover:bg-[#e6b800] text-black uppercase tracking-[0.15em] rounded-sm disabled:opacity-40" data-testid="seni-finalize-btn">
+        <CheckCircle2 className="w-4 h-4 mr-2"/>Finalisasi & Setujui
+      </Button>
+    </div>
   );
 }
 

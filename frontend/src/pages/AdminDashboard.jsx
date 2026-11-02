@@ -694,6 +694,8 @@ function ScoringRulesTab({ eventId }) {
         round_count: 3,
         round_duration_sec: 120,
         rest_duration_sec: 60,
+        jury_consensus_window_sec: 2,
+        technical_win_margin: 0,
         points: { pukulan: 1, tendangan: 2, jatuhan: 3 },
         penalty_points: { teguran_1: 1, teguran_2: 2, peringatan_1: 5, peringatan_2: 10, peringatan_3: 0 },
         binaan_limit: 2,
@@ -774,7 +776,21 @@ function ScoringRulesTab({ eventId }) {
               <Field label="Durasi Ronde (detik)"><Input type="number" value={editing.round_duration_sec} onChange={(e) => setEditing({ ...editing, round_duration_sec: Number(e.target.value) || 60 })} className="bg-[#141414] border-white/10" data-testid="rule-round-duration-input"/></Field>
               <Field label="Istirahat (detik)"><Input type="number" value={editing.rest_duration_sec} onChange={(e) => setEditing({ ...editing, rest_duration_sec: Number(e.target.value) || 0 })} className="bg-[#141414] border-white/10"/></Field>
               <Field label="Batas Binaan"><Input type="number" value={editing.binaan_limit} onChange={(e) => setEditing({ ...editing, binaan_limit: Number(e.target.value) || 0 })} className="bg-[#141414] border-white/10"/></Field>
+              <Field label="Jendela Konsensus (detik)">
+                <Input type="number" min={1} max={10} value={editing.jury_consensus_window_sec ?? 2} onChange={(e) => {
+                  const n = Number(e.target.value);
+                  const windowSec = Number.isFinite(n) ? Math.min(10, Math.max(1, Math.round(n))) : 2;
+                  setEditing({ ...editing, jury_consensus_window_sec: windowSec });
+                }} className="bg-[#141414] border-white/10" data-testid="rule-consensus-window-input"/>
+              </Field>
+              <Field label="Selisih Menang Teknik (0 = mati)">
+                <Input type="number" min={0} value={editing.technical_win_margin ?? 0} onChange={(e) => {
+                  const n = Number(e.target.value);
+                  setEditing({ ...editing, technical_win_margin: Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0 });
+                }} className="bg-[#141414] border-white/10" data-testid="rule-technical-margin-input"/>
+              </Field>
             </div>
+            <p className="text-xs text-zinc-500 -mt-2">Jendela konsensus adalah batas dua juri menekan aksi yang sama. Selisih 0 membuat menang teknik tidak aktif.</p>
             <div>
               <div className="text-xs tracking-[0.2em] uppercase text-zinc-400 mb-3">Poin Tindakan</div>
               <div className="grid grid-cols-3 gap-3">
@@ -825,7 +841,11 @@ function CategoriesTab({ eventId }) {
       setOpen(false); load();
     } catch (e) { toast.error(formatApiError(e)); }
   };
-  const del = async (id) => { if (!window.confirm("Hapus kategori?")) return; await api.delete(`/categories/${id}`); load(); };
+  const del = async (id) => {
+    if (!window.confirm("Hapus kategori?")) return;
+    try { await api.delete(`/categories/${id}`); load(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
 
   return (
     <>
@@ -895,7 +915,11 @@ function ClassesTab({ eventId }) {
       setOpen(false); load();
     } catch (e) { toast.error(formatApiError(e)); }
   };
-  const del = async (id) => { if (!window.confirm("Hapus kelas?")) return; await api.delete(`/classes/${id}`); load(); };
+  const del = async (id) => {
+    if (!window.confirm("Hapus kelas?")) return;
+    try { await api.delete(`/classes/${id}`); load(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
   const catName = (id) => cats.find(c => c.id === id)?.name || "-";
 
   return (
@@ -995,7 +1019,11 @@ function ContingentsTab({ eventId }) {
       setOpen(false); load();
     } catch (e) { toast.error(formatApiError(e)); }
   };
-  const del = async (id) => { if (!window.confirm("Hapus kontingen?")) return; await api.delete(`/contingents/${id}`); load(); };
+  const del = async (id) => {
+    if (!window.confirm("Hapus kontingen?")) return;
+    try { await api.delete(`/contingents/${id}`); load(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
 
   return (
     <>
@@ -1040,7 +1068,11 @@ function AthletesTab({ eventId }) {
       setOpen(false); load();
     } catch (e) { toast.error(formatApiError(e)); }
   };
-  const del = async (id) => { if (!window.confirm("Hapus atlet?")) return; await api.delete(`/athletes/${id}`); load(); };
+  const del = async (id) => {
+    if (!window.confirm("Hapus atlet?")) return;
+    try { await api.delete(`/athletes/${id}`); load(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
   const contName = (id) => conts.find(c => c.id === id)?.name || "-";
   const clsName = (id) => classes.find(c => c.id === id)?.name || "-";
 
@@ -1110,6 +1142,11 @@ function UsersTab() {
   const openEdit = (u) => { setEditing(u); setForm({ name: u.name, email: u.email, password: "", role: u.role }); setOpen(true); };
   const save = async () => {
     try {
+      const password = form.password || "";
+      if ((!editing && password.length < 8) || (editing && password && password.length < 8)) {
+        toast.error("Kata sandi minimal 8 karakter");
+        return;
+      }
       if (editing) {
         const payload = { name: form.name, email: form.email, role: form.role };
         if (form.password) payload.password = form.password;
@@ -1145,7 +1182,8 @@ function UsersTab() {
           <Field label="Nama"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="user-name-input"/></Field>
           <Field label="Email"><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="user-email-input"/></Field>
           <Field label={editing ? "Kata Sandi (kosongkan jika tidak diubah)" : "Kata Sandi"}>
-            <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="user-password-input"/>
+            <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="user-password-input" autoComplete="new-password"/>
+            <p className="text-[11px] text-zinc-500 mt-1">Minimal 8 karakter.</p>
           </Field>
           <Field label="Role">
             <Select value={form.role} onValueChange={(v) => setForm({ ...form, role: v })}>

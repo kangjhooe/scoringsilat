@@ -4,6 +4,13 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Printer, ArrowLeft } from "lucide-react";
 import { resolvePhotoUrl } from "@/components/PhotoUpload";
+import { seniPenaltyLabel } from "@/pages/SeniScoring";
+
+const SENI_LABEL = { tunggal: "Tunggal", ganda: "Ganda", regu: "Regu" };
+
+function formatPoints(value) {
+  return Number(value || 0).toFixed(2);
+}
 
 export default function MatchReport() {
   const { matchId } = useParams();
@@ -13,11 +20,20 @@ export default function MatchReport() {
   const [arenas, setArenas] = useState({});
   const [events, setEvents] = useState({});
   const [logs, setLogs] = useState([]);
+  const [seni, setSeni] = useState(null);
 
   useEffect(() => {
     api.get(`/matches/${matchId}`).then((r) => setState(r.data));
     api.get(`/matches/${matchId}/logs`).then((r) => setLogs(r.data));
   }, [matchId]);
+
+  useEffect(() => {
+    if (!state?.discipline || state.discipline === "tanding") {
+      setSeni(null);
+      return;
+    }
+    api.get(`/matches/${matchId}/seni`).then((r) => setSeni(r.data)).catch(() => setSeni(null));
+  }, [state?.discipline, matchId]);
 
   useEffect(() => {
     if (!state?.event_id) return;
@@ -38,8 +54,8 @@ export default function MatchReport() {
   const blue = athletes[state.blue_athlete_id] || {};
   const arena = arenas[state.arena_id] || {};
   const event = events[state.event_id] || {};
-
-  const winnerName = state.winner_corner === "red" ? red.name : state.winner_corner === "blue" ? blue.name : "Seri";
+  const seniMode = Boolean(state.discipline && state.discipline !== "tanding");
+  const winnerName = state.winner_corner === "red" ? red.name : state.winner_corner === "blue" ? blue.name : state.winner_corner === "draw" ? "Seri" : "—";
 
   return (
     <div className="min-h-screen bg-zinc-100 text-black print:bg-white">
@@ -58,7 +74,7 @@ export default function MatchReport() {
             <img src={resolvePhotoUrl(event.logo_url)} alt="logo" className="w-16 h-16 object-contain" onError={(e) => { e.currentTarget.style.display = "none"; }} />
           )}
           <div className="flex-1">
-            <div className="text-xs tracking-[0.3em] uppercase text-zinc-600">Laporan Hasil Pertandingan</div>
+            <div className="text-xs tracking-[0.3em] uppercase text-zinc-600">{seniMode ? "Laporan Hasil Seni" : "Laporan Hasil Pertandingan"}</div>
             <h1 className="text-3xl font-bold mt-1" data-testid="report-event-name">{event.name || "Kejuaraan Pencak Silat"}</h1>
             <div className="text-sm text-zinc-700 mt-1">{event.location} · {event.start_date} → {event.end_date}</div>
           </div>
@@ -69,10 +85,13 @@ export default function MatchReport() {
           <Info label="Gelanggang" value={arena.name || "—"} />
           <Info label="Babak" value={state.round_label || "—"} />
           <Info label="Status" value={(state.status || "").toUpperCase()} />
+          {seniMode && <Info label="Kategori" value={`Seni ${SENI_LABEL[state.discipline] || state.discipline}`} />}
           <Info label="Mulai" value={state.started_at ? new Date(state.started_at).toLocaleString("id-ID") : "—"} />
           <Info label="Selesai" value={state.finished_at ? new Date(state.finished_at).toLocaleString("id-ID") : "—"} />
         </div>
 
+        {seniMode ? <SeniReportBody seni={seni} /> : (
+        <>
         <div className="grid grid-cols-2 gap-4 mb-8">
           <div className="border-2 border-[#dc2626] p-4 flex gap-3" data-testid="report-red-corner">
             <div className="w-20 h-20 rounded-sm overflow-hidden bg-zinc-100 border border-[#dc2626]/30 shrink-0">
@@ -153,6 +172,8 @@ export default function MatchReport() {
             </tbody>
           </table>
         </div>
+        </>
+        )}
 
         {state.approval_notes && (
           <div className="mb-6">
@@ -166,6 +187,95 @@ export default function MatchReport() {
           <div className="text-center"><div className="border-t border-black pt-2 text-xs">Ketua Juri</div><div className="text-xs mt-1">{state.approved_by_name || ""}</div></div>
           <div className="text-center"><div className="border-t border-black pt-2 text-xs">Operator</div></div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function SeniReportBody({ seni }) {
+  if (!seni) return <div className="mb-8 text-sm text-zinc-600">Memuat nilai seni...</div>;
+  const athletes = seni.athletes || [];
+  return (
+    <div data-testid="report-seni">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+        {athletes.map((athlete) => (
+          <div key={athlete.id} className="border-2 border-black p-4 flex gap-3" data-testid="report-seni-athlete">
+            <div className="w-20 h-20 rounded-sm overflow-hidden bg-zinc-100 border border-zinc-300 shrink-0">
+              {athlete.photo_url ? (
+                <img src={resolvePhotoUrl(athlete.photo_url)} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.style.display = "none"; }} />
+              ) : (
+                <div className="w-full h-full grid place-items-center font-bold text-xl">{(athlete.name || "?").slice(0, 1)}</div>
+              )}
+            </div>
+            <div className="min-w-0">
+              <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-600 font-bold">Pesilat</div>
+              <div className="text-xl font-bold mt-1">{athlete.name || "—"}</div>
+              <div className="text-sm text-zinc-700">{athlete.weight ? `${athlete.weight} kg` : ""} {athlete.gender || ""}</div>
+            </div>
+          </div>
+        ))}
+        {athletes.length === 0 && <div className="text-sm text-zinc-600">Pesilat belum diisi</div>}
+      </div>
+
+      <div className="border-2 border-black p-4 mb-8 text-center">
+        <div className="text-xs tracking-[0.3em] uppercase text-zinc-600">Nilai Akhir</div>
+        <div className="text-5xl font-bold mt-1" data-testid="report-seni-final">{formatPoints(seni.final_score)}</div>
+        <div className="text-sm mt-2">Rata-rata {formatPoints(seni.average)} · Hukuman −{formatPoints(seni.total_penalty)}</div>
+      </div>
+
+      <div className="mb-6">
+        <h3 className="text-sm font-bold uppercase tracking-wide mb-2">Komponen Nilai Juri</h3>
+        <table className="w-full text-sm border border-zinc-300" data-testid="report-seni-jury">
+          <thead className="bg-zinc-100">
+            <tr>
+              <th className="p-2 text-left">Juri</th>
+              <th className="p-2 text-right">Teknik</th>
+              <th className="p-2 text-right">Wirama</th>
+              <th className="p-2 text-right">Penghayatan</th>
+              <th className="p-2 text-right">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(seni.scores || []).map((score) => (
+              <tr key={score.jury_id || score.jury_position} className="border-t border-zinc-200">
+                <td className="p-2">{score.jury_name || `J${score.jury_position}`}</td>
+                <td className="p-2 text-right">{formatPoints(score.teknik)}</td>
+                <td className="p-2 text-right">{formatPoints(score.wirama)}</td>
+                <td className="p-2 text-right">{formatPoints(score.penghayatan)}</td>
+                <td className="p-2 text-right font-bold">{formatPoints(score.total)}</td>
+              </tr>
+            ))}
+            {(seni.scores || []).length === 0 && (
+              <tr><td colSpan={5} className="p-3 text-center text-zinc-500">Belum ada nilai juri</td></tr>
+            )}
+          </tbody>
+        </table>
+        {seni.dropped_high_low && <div className="text-xs text-zinc-600 mt-2">Nilai tertinggi dan terendah tidak dihitung.</div>}
+      </div>
+
+      <div className="mb-6">
+        <h3 className="text-sm font-bold uppercase tracking-wide mb-2">Hukuman</h3>
+        <table className="w-full text-sm border border-zinc-300" data-testid="report-seni-penalties">
+          <thead className="bg-zinc-100">
+            <tr><th className="p-2 text-left">Jenis</th><th className="p-2 text-left">Catatan</th><th className="p-2 text-right">Nilai</th></tr>
+          </thead>
+          <tbody>
+            {(seni.penalties || []).map((penalty) => (
+              <tr key={penalty.id} className="border-t border-zinc-200">
+                <td className="p-2">{seniPenaltyLabel(penalty.code)}</td>
+                <td className="p-2">{penalty.notes || "—"}</td>
+                <td className="p-2 text-right">−{formatPoints(penalty.value)}</td>
+              </tr>
+            ))}
+            {(seni.penalties || []).length === 0 && (
+              <tr><td colSpan={3} className="p-3 text-center text-zinc-500">Tidak ada hukuman</td></tr>
+            )}
+            <tr className="border-t-2 border-black font-bold">
+              <td className="p-2" colSpan={2}>Total hukuman</td>
+              <td className="p-2 text-right">−{formatPoints(seni.total_penalty)}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
   );

@@ -388,6 +388,20 @@ def test_cannot_approve_scheduled_match(tokens, demo):
         requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
 
 
+def _create_match(tokens, demo, number, label):
+    created = requests.post(f"{API}/matches", headers=H(tokens["operator"]), json={
+        "event_id": demo["event"]["id"],
+        "arena_id": demo["arenas"][0]["id"],
+        "scoring_rule_id": demo["rule"]["id"],
+        "red_athlete_id": demo["athletes"][0]["id"],
+        "blue_athlete_id": demo["athletes"][1]["id"],
+        "match_number": number,
+        "round_label": label,
+    })
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
 def test_cannot_restart_approved_match(tokens, demo):
     h = H(tokens["operator"])
     created = requests.post(f"{API}/matches", headers=h, json={
@@ -405,6 +419,125 @@ def test_cannot_restart_approved_match(tokens, demo):
         _play_match(tokens, mid, "red")
         restart = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"})
         assert restart.status_code == 400
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_next_round_rejected_when_match_approved(tokens, demo):
+    mid = _create_match(tokens, demo, 1010, "TEST_LOCKED_APPROVED")
+    try:
+        played = _play_match(tokens, mid, "red")
+        assert played["status"] == "approved"
+        nxt = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "next_round"})
+        assert nxt.status_code == 400, nxt.text
+        after = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+        assert after["status"] == "approved"
+        assert after["current_round"] == played["current_round"]
+        assert after["winner_corner"] == played["winner_corner"]
+        assert after.get("finished_at") == played.get("finished_at")
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_timer_actions_rejected_when_match_finished(tokens, demo):
+    mid = _create_match(tokens, demo, 1011, "TEST_LOCKED_FINISHED")
+    try:
+        assert requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"}).status_code == 200
+        ended = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "end_match"})
+        assert ended.status_code == 200, ended.text
+        assert ended.json()["status"] == "finished"
+        before = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+        for action in ("start", "pause", "resume", "reset", "next_round", "end_match"):
+            denied = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": action})
+            assert denied.status_code == 400, f"{action}: {denied.text}"
+            after = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+            assert after["status"] == "finished"
+            assert after["current_round"] == before["current_round"]
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+@pytest.mark.parametrize("action_type,code,winner", [
+    ("absolute_win", "menang_mutlak", "red"),
+    ("penalty", "peringatan_3", "blue"),
+])
+def test_invalidate_decisive_log_reopens_before_approval(tokens, demo, action_type, code, winner):
+    number = 1012 if action_type == "absolute_win" else 1013
+    mid = _create_match(tokens, demo, number, f"TEST_REOPEN_{code}")
+    try:
+        assert requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"}).status_code == 200
+        act = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["wasit"]), json={
+            "corner": "red", "action_type": action_type, "code": code,
+        })
+        assert act.status_code == 200, act.text
+        finished = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+        assert finished["status"] == "finished"
+        assert finished["winner_corner"] == winner
+        inv = requests.post(
+            f"{API}/matches/{mid}/logs/{act.json()['id']}/invalidate",
+            headers=H(tokens["ketuajuri"]),
+        )
+        assert inv.status_code == 200, inv.text
+        after = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+        assert after["status"] == "paused"
+        assert not after.get("winner_corner")
+        assert not after.get("decision_method")
+        assert not after.get("finished_at")
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_invalidate_rejected_when_approved(tokens, demo):
+    mid = _create_match(tokens, demo, 1014, "TEST_NO_CORRECT_APPROVED")
+    try:
+        assert requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"}).status_code == 200
+        paused = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "pause"})
+        assert paused.status_code == 200, paused.text
+        act = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["wasit"]), json={
+            "corner": "red", "action_type": "penalty", "code": "teguran_1",
+        })
+        assert act.status_code == 200, act.text
+        approved = requests.post(
+            f"{API}/matches/{mid}/approve",
+            headers=H(tokens["ketuajuri"]),
+            json={"winner_corner": "blue", "decision_method": "menang_angka"},
+        )
+        assert approved.status_code == 200, approved.text
+        inv = requests.post(
+            f"{API}/matches/{mid}/logs/{act.json()['id']}/invalidate",
+            headers=H(tokens["ketuajuri"]),
+        )
+        assert inv.status_code == 400, inv.text
+        logs = requests.get(f"{API}/matches/{mid}/logs", headers=H(tokens["admin"])).json()
+        saved = next(l for l in logs if l["id"] == act.json()["id"])
+        assert saved["valid"] is True
+        after = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+        assert after["status"] == "approved"
+        assert after["winner_corner"] == "blue"
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_invalidate_regular_log_keeps_finished_match(tokens, demo):
+    mid = _create_match(tokens, demo, 1015, "TEST_SCORE_STAYS_FINISHED")
+    try:
+        assert requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"}).status_code == 200
+        act = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["wasit"]), json={
+            "corner": "red", "action_type": "penalty", "code": "teguran_1",
+        })
+        assert act.status_code == 200, act.text
+        ended = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "end_match"})
+        assert ended.status_code == 200, ended.text
+        inv = requests.post(
+            f"{API}/matches/{mid}/logs/{act.json()['id']}/invalidate",
+            headers=H(tokens["ketuajuri"]),
+        )
+        assert inv.status_code == 200, inv.text
+        after = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+        assert after["status"] == "finished"
+        logs = requests.get(f"{API}/matches/{mid}/logs", headers=H(tokens["admin"])).json()
+        saved = next(l for l in logs if l["id"] == act.json()["id"])
+        assert saved["valid"] is False
     finally:
         requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
 
@@ -559,3 +692,85 @@ def test_bracket_reaches_final_and_champion(tokens, demo):
     finally:
         for athlete in athletes:
             requests.delete(f"{API}/athletes/{athlete['id']}", headers=h)
+        if bracket_id:
+            requests.delete(f"{API}/brackets/{bracket_id}", headers=h)
+
+
+def _mongo():
+    from pathlib import Path
+    from dotenv import load_dotenv
+    from pymongo import MongoClient
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    return MongoClient(os.environ["MONGO_URL"])
+
+
+def test_delete_match_removes_seni_records(tokens, demo):
+    mid = _create_match(tokens, demo, 1016, "TEST_DELETE_SENI")
+    client = None
+    try:
+        score = requests.post(f"{API}/matches/{mid}/seni/score", headers=H(tokens["ketuajuri"]), json={
+            "jury_position": 1, "teknik": 55, "wirama": 28, "penghayatan": 18,
+        })
+        assert score.status_code == 200, score.text
+        penalty = requests.post(f"{API}/matches/{mid}/seni/penalty", headers=H(tokens["ketuajuri"]), json={
+            "code": "waktu", "value": 1, "notes": "hapus-ikut-partai",
+        })
+        assert penalty.status_code == 200, penalty.text
+        assert penalty.json()["jury_count"] == 1
+        assert penalty.json()["penalties"]
+        deleted = requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+        assert deleted.status_code == 200, deleted.text
+        missing = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+        assert missing.status_code == 404
+        client = _mongo()
+        database = client[os.environ["DB_NAME"]]
+        assert database.seni_scores.count_documents({"match_id": mid}) == 0
+        assert database.seni_penalties.count_documents({"match_id": mid}) == 0
+        assert database.matches.count_documents({"id": mid}) == 0
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+        if client is not None:
+            client.close()
+
+
+def test_running_bracket_match_cannot_be_deleted(tokens, demo):
+    h = H(tokens["admin"])
+    athletes = demo["athletes"]
+    assert len(athletes) >= 2
+    created = requests.post(f"{API}/brackets", headers=h, json={
+        "event_id": demo["event"]["id"],
+        "name": "TEST_LockedBracket",
+        "size": 2,
+        "auto_fill": False,
+        "arena_id": demo["arenas"][0]["id"],
+        "scoring_rule_id": demo["rule"]["id"],
+        "discipline": "tanding",
+    })
+    assert created.status_code == 200, created.text
+    bracket_id = created.json()["id"]
+    try:
+        round1 = sorted([s for s in created.json()["slots"] if s["round"] == 1], key=lambda s: s["position"])
+        assert len(round1) >= 2
+        for slot, athlete in zip(round1, athletes[:2]):
+            assigned = requests.put(
+                f"{API}/brackets/{bracket_id}/slots/{slot['id']}",
+                headers=h,
+                json={"athlete_id": athlete["id"]},
+            )
+            assert assigned.status_code == 200, assigned.text
+        started = requests.post(f"{API}/brackets/{bracket_id}/start", headers=h)
+        assert started.status_code == 200, started.text
+        assert started.json()["status"] == "running"
+        match_ids = []
+        for slot in started.json()["slots"]:
+            match_id = slot.get("match_id")
+            if match_id and match_id not in match_ids:
+                match_ids.append(match_id)
+        assert match_ids
+        denied = requests.delete(f"{API}/matches/{match_ids[0]}", headers=h)
+        assert denied.status_code == 400, denied.text
+        assert "bracket" in denied.text.lower()
+        still = requests.get(f"{API}/matches/{match_ids[0]}", headers=h)
+        assert still.status_code == 200
+    finally:
+        requests.delete(f"{API}/brackets/{bracket_id}", headers=h)

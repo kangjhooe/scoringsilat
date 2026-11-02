@@ -29,8 +29,8 @@ Yang wajib diselesaikan sebelum event:
 | --- | --- |
 | Repo GitHub dibuat **private** | Kode, struktur API, dan alur login tidak perlu publik |
 | `PUBLIC_BACKEND_URL` diisi URL HTTPS yang benar, lalu image di-build ulang | URL backend tertanam saat build frontend |
-| Akun demo dinonaktifkan | Setiap start backend, akun `operator@silat.id`, `juri1@silat.id`, dan akun demo lain dibuat lagi jika belum ada, dengan password `password123`. Event demo juga ikut terbuat |
-| Password admin hanya diubah lewat `.env.production` | Saat container start, password admin di database disamakan lagi dengan `ADMIN_PASSWORD` |
+| Akun demo tidak ikut terpasang | `SEED_DEMO=false`. Akun `operator@silat.id`, `juri1@silat.id`, dan akun sejenis tidak dibuat saat backend start |
+| Kata sandi admin yang diganti di aplikasi tetap tersimpan | Restart tidak menimpa hash. `ADMIN_PASSWORD` hanya dipakai bila akun itu belum ada. Lupa kata sandi: `bash deploy/reset-admin-password.sh` |
 | HTTPS aktif | Login memakai JWT. Jangan buka aplikasi lewat HTTP di internet |
 | Port `27017` tidak di-publish | MongoDB di compose ini belum memakai username/password |
 | Satu replika backend | Menambah replika akan memecah skor live antar proses |
@@ -154,6 +154,7 @@ DB_NAME=digital_silat
 JWT_SECRET=sudah-terisi-otomatis-jangan-diganti-sembarangan
 ADMIN_EMAIL=admin@silat.id
 ADMIN_PASSWORD=password-admin-yang-kuat
+SEED_DEMO=false
 ```
 
 `PUBLIC_BACKEND_URL` harus sama dengan URL yang dibuka pengguna, termasuk `https://`, tanpa garis miring di akhir.
@@ -211,9 +212,9 @@ Jangan mengubah aplikasi agar listen `0.0.0.0:80` kalau di server yang sama suda
 ## 6. Sebelum dibuka ke peserta
 
 1. Login sebagai admin dengan email dan password dari `.env.production`.
-2. Ganti password hanya dengan mengedit `ADMIN_PASSWORD`, lalu jalankan `bash deploy/deploy.sh` lagi. Mengganti password lewat database saja akan tertimpa saat container start.
-3. Hapus atau jangan memakai akun demo (`*@silat.id` selain admin) untuk tugas juri sungguhan. Buat akun juri, wasit, ketua juri, timer, dan operator dari menu admin, dengan password masing-masing.
-4. Perhatikan: selama kode seed masih aktif, akun demo dengan password `password123` akan **muncul kembali** setelah backend restart jika email itu tidak ada di database. Untuk event publik, nonaktifkan seed demo di `backend/server.py` (`seed_demo_users` dan `seed_demo_event`) sebelum push, lalu deploy ulang.
+2. Kata sandi yang diganti lewat menu pengguna tetap dipakai setelah restart. `ADMIN_PASSWORD` tidak menimpa akun yang sudah ada. Bila kata sandi admin lupa, jalankan `bash deploy/reset-admin-password.sh`.
+3. Buat akun juri, wasit, ketua juri, timer, dan operator dari menu admin. Kata sandi akun baru minimal 8 karakter.
+4. Pastikan `.env.production` berisi `SEED_DEMO=false`. Akun demo tidak dibuat ulang saat restart. Akun demo yang sudah tersimpan dari pemasangan lama tetap bisa login sampai dihapus di menu pengguna.
 5. Buat event sungguhan. Event "Kejuaraan Nasional Pencak Silat 2026 (Demo)" boleh dihapus dari panel admin.
 6. Uji dari HP dan laptop: login, input skor juri, layar skor, timer, dan cetak PDF.
 7. Uji bahwa dua juri di gelanggang yang sama melihat perubahan skor tanpa refresh.
@@ -276,8 +277,8 @@ bash deploy/check-ports.sh
 | Halaman terbuka, API gagal / skor tidak live | `PUBLIC_BACKEND_URL` salah atau masih `http://localhost:8000`. Ubah `.env.production`, lalu `bash deploy/deploy.sh` |
 | Login berhasil di HTTP, lalu gagal setelah pakai domain | Campuran `http` dan `https`, atau URL build lama |
 | WebSocket putus | Proxy atau tunnel tidak meneruskan header `Upgrade` |
-| Password admin kembali seperti semula | `ADMIN_PASSWORD` di `.env.production` masih password lama; backend menimpanya tiap start |
-| Akun `juri1@silat.id` / `password123` bisa login | Seed demo masih aktif |
+| Password admin kembali seperti semula | Restart tidak lagi menimpa kata sandi. Kalau reset terasa gagal, jalankan ulang `bash deploy/reset-admin-password.sh` dan pastikan script selesai tanpa error |
+| Akun `juri1@silat.id` / `password123` bisa login | Akun itu sudah ada di database, atau `SEED_DEMO=true`. Hapus dari menu pengguna dan biarkan `SEED_DEMO=false` |
 | `git pull` ditolak | Repo private belum punya deploy key, atau ada perubahan lokal di server. Jangan mengedit kode di server |
 | Container `backend` tidak sehat | Mongo belum siap, atau `JWT_SECRET` / env tidak terbaca. Lihat log backend |
 
@@ -286,8 +287,8 @@ bash deploy/check-ports.sh
 - [ ] Repo GitHub private, tanpa file `.env`
 - [ ] Server memakai Docker, aplikasi jalan lewat `docker compose ps`
 - [ ] `https://domain-anda/api/` membalas status ok
-- [ ] Login admin hanya dengan password kuat dari `.env.production`
-- [ ] Akun demo tidak dipakai, dan seed demo sudah dimatikan untuk event publik
+- [ ] Login admin memakai kata sandi yang tersimpan. Nilai awal ada di `.env.production`, dan penggantian lewat aplikasi tidak kembali saat restart
+- [ ] `SEED_DEMO=false`, dan akun demo yang sudah ada dihapus dari menu pengguna
 - [ ] Event, gelanggang, dan akun petugas asli sudah dibuat
 - [ ] Skor juri tampil di layar tanpa refresh
 - [ ] Backup pertama sudah diunduh keluar server

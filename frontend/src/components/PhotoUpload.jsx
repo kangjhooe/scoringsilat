@@ -15,6 +15,14 @@ export function resolvePhotoUrl(url) {
   return url;
 }
 
+/** Absolute URL only for a file this server stored under /api/uploads/. */
+const LOCAL_UPLOAD = /^\/api\/uploads\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function localUploadHref(url) {
+  if (typeof url !== "string" || !LOCAL_UPLOAD.test(url)) return "";
+  return `${BACKEND_URL}${url}`;
+}
+
 /**
  * PhotoUpload — combined file uploader + URL input.
  * - On file select: uploads to /api/uploads/photo, sets value to returned URL (e.g. /api/uploads/xxx.png)

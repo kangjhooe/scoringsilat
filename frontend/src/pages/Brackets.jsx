@@ -64,8 +64,11 @@ export function BracketsList() {
     } catch (e) { toast.error(e?.response?.data?.detail || "Gagal"); }
   };
 
-  const remove = async (id) => {
-    if (!window.confirm("Hapus bracket ini?")) return;
+  const remove = async (id, status) => {
+    const msg = status && status !== "draft"
+      ? "Hapus bracket ini beserta semua pertandingan yang sudah dibuat? Tindakan ini tidak bisa dibatalkan."
+      : "Hapus bracket ini?";
+    if (!window.confirm(msg)) return;
     try { await api.delete(`/brackets/${id}`); toast.success("Terhapus"); load(); }
     catch (e) { toast.error(e?.response?.data?.detail || "Gagal hapus"); }
   };
@@ -80,8 +83,8 @@ export function BracketsList() {
         </div>
         <div className="flex gap-2 items-center">
           <Select value={eventId} onValueChange={(v) => { setEventId(v); localStorage.setItem("admin_event_id", v); }}>
-            <SelectTrigger className="bg-[#0a0a0a] border-white/10 w-72" data-testid="bracket-event-select"><SelectValue placeholder="Pilih event"/></SelectTrigger>
-            <SelectContent className="bg-[#141414] border-white/10 text-white">
+            <SelectTrigger className="bg-[#141414] border-white/40 text-white w-72" data-testid="bracket-event-select"><SelectValue placeholder="Pilih event"/></SelectTrigger>
+            <SelectContent className="bg-[#141414] border-white/30 text-white">
               {events.map((e) => <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>)}
             </SelectContent>
           </Select>
@@ -108,9 +111,7 @@ export function BracketsList() {
                 <Link to={`/brackets/${b.id}`} className="flex-1">
                   <Button size="sm" className="w-full bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-sm uppercase tracking-[0.15em] text-[10px]" data-testid={`bracket-view-${b.id}`}><Eye className="w-3.5 h-3.5 mr-2"/>Lihat</Button>
                 </Link>
-                {b.status === "draft" && (
-                  <Button size="sm" onClick={() => remove(b.id)} className="bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 rounded-sm" data-testid={`bracket-del-${b.id}`}><Trash2 className="w-3.5 h-3.5"/></Button>
-                )}
+                <Button size="sm" onClick={() => remove(b.id, b.status)} className="bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 rounded-sm" data-testid={`bracket-del-${b.id}`}><Trash2 className="w-3.5 h-3.5"/></Button>
               </div>
             </div>
           ))}
@@ -204,6 +205,18 @@ export function BracketView({ publicMode = false }) {
     catch (e) { toast.error(e?.response?.data?.detail || "Gagal"); }
   };
 
+  const remove = async () => {
+    const msg = data?.status && data.status !== "draft"
+      ? "Hapus bracket ini beserta semua pertandingan yang sudah dibuat? Tindakan ini tidak bisa dibatalkan."
+      : "Hapus bracket ini?";
+    if (!window.confirm(msg)) return;
+    try {
+      await api.delete(`/brackets/${bid}`);
+      toast.success("Terhapus");
+      nav("/brackets");
+    } catch (e) { toast.error(e?.response?.data?.detail || "Gagal hapus"); }
+  };
+
   if (!data) return <Wrap publicMode={publicMode}><div className="p-12 text-center text-zinc-500">Memuat...</div></Wrap>;
 
   const winner = data.status === "completed" ? data.slots.find((s) => s.round === Math.max(...data.slots.map((x) => x.round)))?.athlete : null;
@@ -226,6 +239,9 @@ export function BracketView({ publicMode = false }) {
             <Link to={`/bracket/${bid}/public`} target="_blank">
               <Button variant="ghost" className="border border-white/10 hover:bg-white/5 text-xs uppercase tracking-[0.15em]" data-testid="bracket-public-btn"><Eye className="w-4 h-4 mr-2"/>Tampilan Publik</Button>
             </Link>
+          )}
+          {!publicMode && (
+            <Button onClick={remove} variant="ghost" className="border border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 text-xs uppercase tracking-[0.15em]" data-testid="bracket-detail-del-btn"><Trash2 className="w-4 h-4 mr-2"/>Hapus</Button>
           )}
         </div>
       </div>

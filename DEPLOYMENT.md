@@ -70,7 +70,12 @@ WEB_PORT=18080
 DB_NAME=digital_silat
 ADMIN_EMAIL=admin@silat.id
 ADMIN_PASSWORD=password-kuat
+SEED_DEMO=false
 ```
+
+`SEED_DEMO=false` membuat akun demo tidak ikut terpasang. Akun `operator@silat.id`, `juri1@silat.id`, dan akun sejenis dengan kata sandi `password123` hanya dibuat bila `SEED_DEMO=true`.
+
+Kata sandi admin yang diganti lewat aplikasi tidak kembali saat backend di-restart. `ADMIN_PASSWORD` dipakai hanya saat akun admin belum ada. Untuk mengganti kata sandi admin yang sudah tersimpan, jalankan `bash deploy/reset-admin-password.sh`.
 
 Lalu deploy ulang:
 
@@ -171,7 +176,7 @@ Restart:
 docker compose -f docker-compose.prod.yml --env-file .env.production restart
 ```
 
-Reset password admin:
+Reset password admin. Script ini menulis kata sandi baru ke database. Restart saja tidak mengembalikan kata sandi yang sudah diganti di aplikasi:
 
 ```bash
 bash deploy/reset-admin-password.sh

@@ -12,6 +12,7 @@ import PublicRegister from "@/pages/PublicRegister";
 import RegistrationsAdmin from "@/pages/RegistrationsAdmin";
 import WAHASettings from "@/pages/WAHASettings";
 import { BracketsList, BracketView } from "@/pages/Brackets";
+import Medals from "@/pages/Medals";
 import SeniScoring from "@/pages/SeniScoring";
 import { PublicSelector, PublicArenaDisplay, PublicMatchDisplay } from "@/pages/PublicDisplay";
 import { EventHome, EventLandingPage } from "@/pages/EventLanding";
@@ -64,6 +65,7 @@ function App() {
 
           {/* Public bracket view (no auth) */}
           <Route path="/bracket/:bid/public" element={<BracketView publicMode={true} />} />
+          <Route path="/medals/:eventId/public" element={<Medals publicMode />} />
 
           {/* Auth */}
           <Route path="/login" element={<Login />} />
@@ -77,6 +79,7 @@ function App() {
           <Route path="/match/:matchId" element={<ProtectedRoute><MatchControl /></ProtectedRoute>} />
           <Route path="/seni/:mid" element={<ProtectedRoute><SeniScoring /></ProtectedRoute>} />
           <Route path="/brackets" element={<ProtectedRoute roles={["admin", "operator"]}><BracketsList /></ProtectedRoute>} />
+          <Route path="/medals" element={<ProtectedRoute roles={["admin", "operator"]}><Medals /></ProtectedRoute>} />
           <Route path="/brackets/:bid" element={<ProtectedRoute roles={["admin", "operator"]}><BracketView /></ProtectedRoute>} />
           <Route path="/report/:matchId" element={<ProtectedRoute><MatchReport /></ProtectedRoute>} />
 

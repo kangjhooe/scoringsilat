@@ -16,6 +16,11 @@ export function openArenaSocket(arenaId, onMessage) {
   return openWS(url, onMessage);
 }
 
+export function openPublicMatchSocket(matchId, onMessage) {
+  const url = wsUrlFor(`/ws/public/match/${matchId}`);
+  return openWS(url, onMessage);
+}
+
 function openWS(url, onMessage) {
   let ws;
   let closed = false;

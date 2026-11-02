@@ -11,12 +11,27 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+function requestCarriedToken(config) {
+  const headers = config?.headers;
+  if (!headers) return false;
+  if (typeof headers.get === "function") {
+    const fromGet = headers.get("Authorization");
+    if (typeof fromGet === "string" && fromGet.trim()) return true;
+  }
+  const direct = headers.Authorization || headers.authorization;
+  return typeof direct === "string" && direct.trim().length > 0;
+}
+
 api.interceptors.response.use(
   (r) => r,
   (e) => {
-    if (e?.response?.status === 401) {
-      // optional: clear bad token
-      // localStorage.removeItem('silat_token');
+    const url = String(e?.config?.url || "");
+    const loginCall = url.includes("/auth/login");
+    if (e?.response?.status === 401 && requestCarriedToken(e.config) && !loginCall) {
+      localStorage.removeItem("silat_token");
+      if (window.location.pathname !== "/login") {
+        window.location.assign("/login");
+      }
     }
     return Promise.reject(e);
   }

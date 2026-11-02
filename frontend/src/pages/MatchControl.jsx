@@ -154,7 +154,10 @@ function MatchHeader({ state, red, blue }) {
           <div className="font-display text-5xl tracking-tighter mt-1" data-testid="header-round">
             {state.current_round} <span className="text-zinc-600 text-3xl">/ {totalRounds}</span>
           </div>
-          <div className={`font-mono-display text-5xl md:text-6xl mt-3 tracking-tighter ${state.timer?.running ? "text-[#ffcc00]" : "text-white"}`} data-testid="header-timer">
+          <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-500 mt-3" data-testid="header-phase">
+            {state.timer?.phase === "rest" ? "Istirahat" : "Waktu"}
+          </div>
+          <div className={`font-mono-display text-5xl md:text-6xl mt-1 tracking-tighter ${state.timer?.running ? "text-[#ffcc00]" : "text-white"}`} data-testid="header-timer">
             {fmtTime(remaining)}
           </div>
           <div className="mt-2"><StatusBadge status={state.status}/></div>
@@ -207,7 +210,9 @@ function StatusBadge({ status }) {
 // ============ Jury Panel ============
 function JuryPanel({ state, role, refresh, red, blue }) {
   const canScore = role === "jury" || role === "admin";
+  const resting = state.timer?.phase === "rest";
   const points = state.rule?.points || { pukulan: 1, tendangan: 2, jatuhan: 3 };
+  const windowSec = state.rule?.jury_consensus_window_sec ?? 2;
 
   const sendScore = async (corner, code, pts) => {
     try {
@@ -226,15 +231,16 @@ function JuryPanel({ state, role, refresh, red, blue }) {
 
   return (
     <div className="space-y-4">
-      <div className="text-xs text-zinc-400">Poin masuk setelah dua juri menekan aksi yang sama dalam 2 detik.</div>
+      <div className="text-xs text-zinc-400">Poin masuk setelah dua juri menekan aksi yang sama dalam {windowSec} detik.</div>
+      {resting && <NoticeBox text="Sedang istirahat. Skor dibuka lagi saat ronde dimulai." />}
       {pending.length > 0 && (
         <div className="border border-[#ffcc00]/40 bg-[#ffcc00]/10 rounded-sm px-4 py-3 text-sm text-[#ffcc00]">
           Menunggu juri lain: {pending.map((v) => `${v.code} sudut ${v.corner === "red" ? "merah" : "biru"}`).join(", ")}
         </div>
       )}
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-6">
-      <CornerJury corner="red" athlete={red} score={state.red.score} buttons={buttons} disabled={!canScore} onScore={(code, pts) => sendScore("red", code, pts)} />
-      <CornerJury corner="blue" athlete={blue} score={state.blue.score} buttons={buttons} disabled={!canScore} onScore={(code, pts) => sendScore("blue", code, pts)} />
+      <CornerJury corner="red" athlete={red} score={state.red.score} buttons={buttons} disabled={!canScore || resting} onScore={(code, pts) => sendScore("red", code, pts)} />
+      <CornerJury corner="blue" athlete={blue} score={state.blue.score} buttons={buttons} disabled={!canScore || resting} onScore={(code, pts) => sendScore("blue", code, pts)} />
     </div>
     </div>
   );
@@ -295,7 +301,6 @@ function RefereePanel({ state, role, refresh }) {
     } catch (e) { toast.error(formatApiError(e)); }
   };
 
-  const fall = async (corner) => send(corner, "fall", "jatuhan");
   const binaan = async (corner) => send(corner, "binaan", "binaan_1");
   const penalty = async (corner, code) => send(corner, "penalty", code);
   const absolute = async (corner) => send(corner, "absolute_win", "menang_mutlak");
@@ -315,12 +320,7 @@ function RefereePanel({ state, role, refresh }) {
               <div className="text-[10px] tracking-[0.3em] uppercase text-white/80">Tindakan untuk Sudut {isRed ? "Merah" : "Biru"}</div>
             </div>
             <div className="p-4 space-y-3">
-              <div className="grid grid-cols-2 gap-2">
-                <Button onClick={() => fall(c)} data-testid={`ref-${c}-fall`} className={`tap-press h-20 rounded-sm font-display text-xl uppercase flex items-center justify-center gap-2 ${isRed ? "bg-[#ff3b30] hover:bg-[#ff5147]" : "bg-[#007aff] hover:bg-[#1f8cff]"}`}>
-                  <ActionIcon code="jatuhan" className="w-6 h-6"/> Jatuhan +3
-                </Button>
-                <Button onClick={() => binaan(c)} data-testid={`ref-${c}-binaan`} className="tap-press h-20 rounded-sm font-display text-xl uppercase bg-zinc-700 hover:bg-zinc-600">Binaan</Button>
-              </div>
+              <Button onClick={() => binaan(c)} data-testid={`ref-${c}-binaan`} className="tap-press w-full h-16 rounded-sm font-display text-xl uppercase bg-zinc-700 hover:bg-zinc-600">Binaan</Button>
               <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mt-3">Pelanggaran (poin ke lawan)</div>
               <div className="grid grid-cols-2 gap-2">
                 {Object.entries(penalties).map(([code, pts]) => (
@@ -346,7 +346,9 @@ function RefereePanel({ state, role, refresh }) {
 // ============ Timer Panel ============
 function TimerPanel({ state, role, refresh }) {
   const can = role === "timer" || role === "operator" || role === "admin";
+  const locked = state.status === "approved" || state.status === "finished";
   const send = async (action) => {
+    if (locked) return;
     try { await api.post(`/matches/${state.id}/timer`, { action }); }
     catch (e) { toast.error(formatApiError(e)); }
   };
@@ -356,29 +358,33 @@ function TimerPanel({ state, role, refresh }) {
   if (!can) return <NoticeBox text="Hanya Timer/Operator yang dapat mengontrol timer." />;
 
   const running = state.timer?.running;
+  const timerBtn = "tap-press h-20 sm:h-24 rounded-sm font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2 disabled:cursor-not-allowed";
   return (
     <div className="grid grid-cols-12 gap-6">
       <div className="col-span-12 md:col-span-6 border border-white/10 rounded-sm bg-[#141414] p-8 text-center">
-        <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400">Sisa Waktu Ronde</div>
+        <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400" data-testid="timer-phase-label">{state.timer?.phase === "rest" ? "Istirahat" : "Sisa Waktu Ronde"}</div>
         <div className={`font-mono-display text-7xl md:text-8xl xl:text-9xl tracking-tighter mt-2 ${running ? "text-[#ffcc00]" : "text-white"}`} data-testid="timer-remaining">{fmtTime(remaining)}</div>
         <div className="text-sm text-zinc-500 mt-2">Ronde {state.current_round} / {state.rule?.round_count || 3}</div>
       </div>
-      <div className="col-span-12 md:col-span-6 grid grid-cols-2 gap-3">
-        <Button onClick={() => send("start")} data-testid="timer-start" className="tap-press h-20 sm:h-24 rounded-sm bg-[#10b981] hover:bg-[#0ea271] text-white font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
-          <Play className="w-5 h-5 mr-2"/> Mulai
-        </Button>
-        <Button onClick={() => send("pause")} data-testid="timer-pause" className="tap-press h-20 sm:h-24 rounded-sm bg-[#ffcc00] hover:bg-[#e6b800] text-black font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
-          <Pause className="w-5 h-5 mr-2"/> Jeda
-        </Button>
-        <Button onClick={() => send("reset")} data-testid="timer-reset" className="tap-press h-20 sm:h-24 rounded-sm bg-zinc-700 hover:bg-zinc-600 text-white font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
-          <RotateCcw className="w-5 h-5 mr-2"/> Reset Ronde
-        </Button>
-        <Button onClick={() => send("next_round")} data-testid="timer-next" className="tap-press h-20 sm:h-24 rounded-sm bg-zinc-700 hover:bg-zinc-600 text-white font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
-          <SkipForward className="w-5 h-5 mr-2"/> Ronde Berikutnya
-        </Button>
-        <Button onClick={() => send("end_match")} data-testid="timer-end" className="tap-press col-span-2 h-16 rounded-sm bg-[#ff3b30] hover:bg-[#ff5147] text-white font-bold uppercase tracking-[0.15em]">
-          <Square className="w-5 h-5 mr-2"/> Akhiri Partai
-        </Button>
+      <div className="col-span-12 md:col-span-6 flex flex-col gap-3">
+        {locked && <div data-testid="timer-locked-notice"><NoticeBox text="Partai sudah dikunci." /></div>}
+        <div className="grid grid-cols-2 gap-3">
+          <Button disabled={locked} onClick={() => send("start")} data-testid="timer-start" className={`${timerBtn} bg-[#10b981] hover:bg-[#0ea271] text-white`}>
+            <Play className="w-5 h-5 mr-2"/> Mulai
+          </Button>
+          <Button disabled={locked} onClick={() => send("pause")} data-testid="timer-pause" className={`${timerBtn} bg-[#ffcc00] hover:bg-[#e6b800] text-black`}>
+            <Pause className="w-5 h-5 mr-2"/> Jeda
+          </Button>
+          <Button disabled={locked} onClick={() => send("reset")} data-testid="timer-reset" className={`${timerBtn} bg-zinc-700 hover:bg-zinc-600 text-white`}>
+            <RotateCcw className="w-5 h-5 mr-2"/> Reset Ronde
+          </Button>
+          <Button disabled={locked} onClick={() => send("next_round")} data-testid="timer-next" className={`${timerBtn} bg-zinc-700 hover:bg-zinc-600 text-white`}>
+            <SkipForward className="w-5 h-5 mr-2"/> Ronde Berikutnya
+          </Button>
+          <Button disabled={locked} onClick={() => send("end_match")} data-testid="timer-end" className="tap-press col-span-2 h-16 rounded-sm bg-[#ff3b30] hover:bg-[#ff5147] text-white font-bold uppercase tracking-[0.15em] disabled:cursor-not-allowed">
+            <Square className="w-5 h-5 mr-2"/> Akhiri Partai
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -392,21 +398,45 @@ function HeadJuryPanel({ state, role, refresh, red, blue }) {
   const [method, setMethod] = useState("menang_angka");
   const [notes, setNotes] = useState("");
 
+  const inBracket = Boolean(state.bracket_id);
+  const needsCorner = inBracket && winner !== "red" && winner !== "blue";
+
   useEffect(() => {
-    if (state.winner_corner === "red" || state.winner_corner === "blue" || state.winner_corner === "draw") {
+    const bracketMatch = Boolean(state.bracket_id);
+    if (state.status === "approved" && (state.winner_corner === "red" || state.winner_corner === "blue" || state.winner_corner === "draw")) {
       setWinner(state.winner_corner);
+      if (state.decision_method) setMethod(state.decision_method);
+      return;
+    }
+    if (state.winner_corner === "red" || state.winner_corner === "blue") {
+      setWinner(state.winner_corner);
+      if (state.decision_method) setMethod(bracketMatch && state.decision_method === "seri" ? "menang_angka" : state.decision_method);
+      return;
+    }
+    if (state.winner_corner === "draw" && !bracketMatch) {
+      setWinner("draw");
       if (state.decision_method) setMethod(state.decision_method);
       return;
     }
     if (state.red.score > state.blue.score) setWinner("red");
     else if (state.blue.score > state.red.score) setWinner("blue");
-    else setWinner("draw");
-  }, [state.red.score, state.blue.score, state.winner_corner, state.decision_method]);
+    else setWinner(bracketMatch ? "" : "draw");
+    if (bracketMatch) setMethod((prev) => (prev === "seri" ? "menang_angka" : prev));
+  }, [state.status, state.red.score, state.blue.score, state.winner_corner, state.decision_method, state.bracket_id]);
 
   const approve = async () => {
+    if (needsCorner) {
+      toast.error("Partai bagan tidak boleh seri. Pilih sudut merah atau biru.");
+      return;
+    }
     try {
-      await api.post(`/matches/${state.id}/approve`, { winner_corner: winner, decision_method: method, notes });
+      const res = await api.post(`/matches/${state.id}/approve`, {
+        winner_corner: winner,
+        decision_method: inBracket && method === "seri" ? "menang_angka" : method,
+        notes,
+      });
       toast.success("Hasil disahkan");
+      if (res.data?.bracket_warning) toast.warning(res.data.bracket_warning);
       setOpen(false);
       refresh();
     } catch (e) { toast.error(formatApiError(e)); }
@@ -438,8 +468,11 @@ function HeadJuryPanel({ state, role, refresh, red, blue }) {
         <StatusBadge status={state.status}/>
         <div className="mt-6 text-xs tracking-[0.3em] uppercase text-zinc-400 mb-3">Pemenang Disarankan</div>
         <div className="font-display text-3xl uppercase tracking-tight">
-          {winner === "red" ? <span className="text-[#ff3b30]">{red?.name || "Sudut Merah"}</span> : winner === "blue" ? <span className="text-[#007aff]">{blue?.name || "Sudut Biru"}</span> : <span className="text-zinc-300">Seri</span>}
+          {winner === "red" ? <span className="text-[#ff3b30]">{red?.name || "Sudut Merah"}</span> : winner === "blue" ? <span className="text-[#007aff]">{blue?.name || "Sudut Biru"}</span> : winner === "draw" ? <span className="text-zinc-300">Seri</span> : <span className="text-zinc-400">Pilih sudut</span>}
         </div>
+        {needsCorner && (
+          <p className="text-xs text-amber-300 mt-3" data-testid="approve-bracket-draw-note">Hasil seri ditolak pada partai bagan. Wajib menunjuk sudut merah atau biru.</p>
+        )}
         <div className="flex-1"></div>
         {state.status === "approved" ? (
           <Button asChild className="bg-emerald-500 hover:bg-emerald-600 text-white rounded-sm uppercase tracking-[0.15em] mt-6">
@@ -457,14 +490,15 @@ function HeadJuryPanel({ state, role, refresh, red, blue }) {
               <div className="space-y-3">
                 <div>
                   <div className="text-[10px] tracking-[0.2em] uppercase text-zinc-400 mb-1">Pemenang</div>
-                  <Select value={winner} onValueChange={setWinner}>
-                    <SelectTrigger className="bg-[#0a0a0a] border-white/10" data-testid="approve-winner-select"><SelectValue/></SelectTrigger>
+                  <Select value={winner || undefined} onValueChange={setWinner}>
+                    <SelectTrigger className="bg-[#0a0a0a] border-white/10" data-testid="approve-winner-select"><SelectValue placeholder="Pilih pemenang"/></SelectTrigger>
                     <SelectContent className="bg-[#141414] border-white/10 text-white">
                       <SelectItem value="red">Sudut Merah — {red?.name}</SelectItem>
                       <SelectItem value="blue">Sudut Biru — {blue?.name}</SelectItem>
-                      <SelectItem value="draw">Seri</SelectItem>
+                      {!inBracket && <SelectItem value="draw">Seri</SelectItem>}
                     </SelectContent>
                   </Select>
+                  {inBracket && <p className="text-xs text-zinc-400 mt-2">Partai bagan wajib punya pemenang. Seri tidak dapat disahkan.</p>}
                 </div>
                 <div>
                   <div className="text-[10px] tracking-[0.2em] uppercase text-zinc-400 mb-1">Metode</div>
@@ -475,7 +509,7 @@ function HeadJuryPanel({ state, role, refresh, red, blue }) {
                       <SelectItem value="menang_mutlak">Menang Mutlak</SelectItem>
                       <SelectItem value="menang_teknik">Menang Teknik</SelectItem>
                       <SelectItem value="menang_diskualifikasi">Menang Diskualifikasi</SelectItem>
-                      <SelectItem value="seri">Seri</SelectItem>
+                      {!inBracket && <SelectItem value="seri">Seri</SelectItem>}
                     </SelectContent>
                   </Select>
                 </div>
@@ -485,7 +519,7 @@ function HeadJuryPanel({ state, role, refresh, red, blue }) {
                 </div>
               </div>
               <DialogFooter>
-                <Button onClick={approve} data-testid="approve-confirm-btn" className="bg-[#ffcc00] hover:bg-[#e6b800] text-black uppercase tracking-[0.15em]">Sahkan</Button>
+                <Button onClick={approve} disabled={needsCorner} data-testid="approve-confirm-btn" className="bg-[#ffcc00] hover:bg-[#e6b800] text-black uppercase tracking-[0.15em] disabled:opacity-50">Sahkan</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>

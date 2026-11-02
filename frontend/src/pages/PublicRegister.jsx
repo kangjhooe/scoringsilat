@@ -7,8 +7,9 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { Toaster, toast } from "sonner";
-import { BACKEND_URL } from "@/lib/api";
-import { Upload, FileCheck2, ArrowRight, ShieldCheck, ClipboardList, IdCard, Stethoscope } from "lucide-react";
+import { BACKEND_URL, formatApiError } from "@/lib/api";
+import { localUploadHref } from "@/components/PhotoUpload";
+import { Upload, FileCheck2, ArrowRight, ShieldCheck, ClipboardList, IdCard, Stethoscope, Copy } from "lucide-react";
 
 const PUB = axios.create({ baseURL: `${BACKEND_URL}/api` });
 
@@ -118,13 +119,13 @@ export default function PublicRegister() {
       // Attach files
       for (const d of REQUIRED_DOCS) {
         if (files[d.key]) {
-          await PUB.post(`/public/registrations/${reg.id}/files`, { registration_id: reg.id, label: d.key, url: files[d.key] });
+          await PUB.post(`/public/registrations/${reg.id}/files`, { registration_id: reg.id, label: d.key, url: files[d.key], access_code: reg.access_code });
         }
       }
       setResult({ ...reg, slug: lockedEvent?.slug || "" });
       toast.success("Registrasi terkirim");
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Gagal mengirim registrasi");
+      toast.error(formatApiError(e) || "Gagal mengirim registrasi");
     } finally { setSubmitting(false); }
   };
 
@@ -167,7 +168,7 @@ export default function PublicRegister() {
             <div className="mb-8">
               <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00] mb-2">Formulir Pendaftaran</div>
               <h1 className="font-display text-4xl md:text-5xl tracking-tight uppercase">Daftar sebagai Peserta</h1>
-              <p className="text-sm text-zinc-400 mt-2">Lengkapi data berikut, lalu unggah dokumen yang diperlukan. Anda akan menerima nomor registrasi setelah submit. Status verifikasi dapat dicek menggunakan nomor registrasi.</p>
+              <p className="text-sm text-zinc-400 mt-2">Lengkapi data berikut, lalu unggah dokumen yang diperlukan. Setelah submit Anda menerima nomor registrasi dan kode akses. Keduanya dipakai untuk memantau status verifikasi.</p>
             </div>
 
             <section className="space-y-6">
@@ -202,7 +203,7 @@ export default function PublicRegister() {
               </FormGroup>
 
               <FormGroup title="Data Diri">
-                <FieldRow label="Nama Lengkap *"><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-name"/></FieldRow>
+                <FieldRow label="Nama Lengkap *"><Input value={form.name} maxLength={120} onChange={(e) => setForm({ ...form, name: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-name"/></FieldRow>
                 <div className="grid grid-cols-2 gap-4">
                   <SelectField label="Jenis Kelamin *" value={form.gender} onChange={(v) => setForm({ ...form, gender: v })} testid="reg-gender">
                     <SelectItem value="putra">Putra</SelectItem>
@@ -212,10 +213,10 @@ export default function PublicRegister() {
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <FieldRow label="Berat (kg)"><Input type="number" value={form.weight} onChange={(e) => setForm({ ...form, weight: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-weight"/></FieldRow>
-                  <FieldRow label="No. WhatsApp *"><Input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="08xxxxxxxxxx" className="bg-[#0a0a0a] border-white/10" data-testid="reg-phone"/></FieldRow>
+                  <FieldRow label="No. WhatsApp *"><Input value={form.phone} maxLength={32} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="08xxxxxxxxxx" className="bg-[#0a0a0a] border-white/10" data-testid="reg-phone"/></FieldRow>
                 </div>
-                <FieldRow label="Email (opsional)"><Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-email"/></FieldRow>
-                <FieldRow label="Alamat (opsional)"><Textarea rows={2} value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-address"/></FieldRow>
+                <FieldRow label="Email (opsional)"><Input type="email" maxLength={254} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-email"/></FieldRow>
+                <FieldRow label="Alamat (opsional)"><Textarea rows={2} maxLength={500} value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-address"/></FieldRow>
               </FormGroup>
 
               <FormGroup title="Dokumen Wajib">
@@ -236,7 +237,7 @@ export default function PublicRegister() {
                 >
                   <ClipboardList className="w-4 h-4 mr-2" /> {submitting ? "Mengirim..." : "Kirim Registrasi"}
                 </Button>
-                <div className="text-xs text-zinc-500">Setelah submit, simpan nomor registrasi Anda untuk cek status.</div>
+                <div className="text-xs text-zinc-500">Setelah submit, salin nomor registrasi dan kode akses. Kode hanya ditampilkan sekali.</div>
               </div>
             </section>
           </>
@@ -285,6 +286,7 @@ function DocUploader({ doc, url, onUploaded }) {
     try {
       const fd = new FormData();
       fd.append("file", f);
+      fd.append("label", doc.key);
       const r = await PUB.post("/public/uploads/document", fd, { headers: { "Content-Type": "multipart/form-data" } });
       onUploaded(r.data.url);
       toast.success(`${doc.label} terunggah`);
@@ -304,27 +306,52 @@ function DocUploader({ doc, url, onUploaded }) {
         <Button size="sm" type="button" onClick={() => ref.current?.click()} disabled={busy} className="bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm" data-testid={`doc-${doc.key}-upload`}>
           <Upload className="w-3.5 h-3.5 mr-1.5" /> {busy ? "Mengunggah..." : done ? "Ganti" : "Unggah"}
         </Button>
-        {done && (
-          <a href={`${BACKEND_URL}${url}`} target="_blank" rel="noreferrer" className="text-[11px] text-emerald-300 hover:underline flex items-center gap-1">
+        {done && localUploadHref(url) && (
+          <a href={localUploadHref(url)} target="_blank" rel="noreferrer" className="text-[11px] text-emerald-300 hover:underline flex items-center gap-1">
             <FileCheck2 className="w-3.5 h-3.5"/> Lihat
           </a>
+        )}
+        {done && !localUploadHref(url) && (
+          <span className="text-[11px] text-emerald-300 flex items-center gap-1">
+            <FileCheck2 className="w-3.5 h-3.5"/> Tersimpan
+          </span>
         )}
       </div>
     </div>
   );
 }
 
+async function copyText(value, label) {
+  try {
+    await navigator.clipboard.writeText(value);
+    toast.success(`${label} disalin`);
+  } catch {
+    toast.error("Salin secara manual");
+  }
+}
+
 function SuccessCard({ reg, onAnother }) {
+  const checkHref = reg.slug
+    ? `/event/${reg.slug}/check?number=${encodeURIComponent(reg.registration_number)}`
+    : `/register?mode=check&number=${encodeURIComponent(reg.registration_number)}`;
   return (
     <div className="border border-emerald-500/30 bg-emerald-500/5 rounded-sm p-8 text-center" data-testid="reg-success">
       <ShieldCheck className="w-12 h-12 mx-auto text-emerald-400 mb-3" />
       <div className="text-[10px] tracking-[0.3em] uppercase text-emerald-300">Registrasi Terkirim</div>
       <h2 className="font-display text-3xl tracking-tight mt-2">Nomor Registrasi Anda</h2>
       <div className="font-mono-display text-2xl text-[#ffcc00] mt-2" data-testid="reg-number">{reg.registration_number}</div>
-      <p className="text-sm text-zinc-300 mt-4 max-w-md mx-auto">Simpan nomor di atas. Status verifikasi dapat dipantau melalui tab <strong>Cek Status</strong> pada halaman ini.</p>
+      <div className="mt-6 max-w-md mx-auto border border-[#ffcc00]/40 bg-[#ffcc00]/10 rounded-sm px-4 py-4 text-left">
+        <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00]">Kode Akses</div>
+        <div className="font-mono-display text-2xl text-white mt-1 break-all" data-testid="reg-access-code">{reg.access_code}</div>
+        <p className="text-xs text-zinc-300 mt-2">Kode ini hanya ditampilkan sekali. Salin dan simpan bersama nomor registrasi. Keduanya diperlukan untuk cek status.</p>
+        <Button type="button" onClick={() => copyText(reg.access_code || "", "Kode akses")} className="mt-3 bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm" data-testid="reg-copy-code">
+          <Copy className="w-4 h-4 mr-2" /> Salin Kode
+        </Button>
+      </div>
+      <p className="text-sm text-zinc-300 mt-4 max-w-md mx-auto">Tautan cek status hanya mengisi nomor registrasi. Masukkan kode akses secara manual pada formulir.</p>
       <div className="flex justify-center gap-3 mt-6">
         <Button onClick={onAnother} className="bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-sm" data-testid="reg-another">Daftar Lagi</Button>
-        <Link to={reg.slug ? `/event/${reg.slug}/check?number=${encodeURIComponent(reg.registration_number)}` : `/register?mode=check&number=${encodeURIComponent(reg.registration_number)}`}>
+        <Link to={checkHref}>
           <Button className="bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm" data-testid="reg-check-status">Cek Status <ArrowRight className="w-4 h-4 ml-2"/></Button>
         </Link>
       </div>
@@ -335,33 +362,50 @@ function SuccessCard({ reg, onAnother }) {
 function StatusCheck() {
   const [searchParams] = useSearchParams();
   const [number, setNumber] = useState(searchParams.get("number") || "");
+  const [code, setCode] = useState("");
   const [data, setData] = useState(null);
   const [busy, setBusy] = useState(false);
-  const lookup = async (n) => {
+  const lookup = async (n, c) => {
     const q = (n ?? number).trim();
-    if (!q) return;
+    const k = (c ?? code).trim();
+    if (!q || !k) {
+      toast.error("Isi nomor registrasi dan kode akses");
+      return;
+    }
     setBusy(true); setData(null);
     try {
-      const r = await PUB.get(`/public/registrations/by-number/${encodeURIComponent(q)}`);
+      const r = await PUB.post("/public/registrations/lookup", { registration_number: q, access_code: k });
       setData(r.data);
     } catch (e) {
       toast.error(e?.response?.data?.detail || "Tidak ditemukan");
     } finally { setBusy(false); }
   };
-  // eslint-disable-next-line
-  useEffect(() => { const n = searchParams.get("number"); if (n) { setNumber(n); lookup(n); } }, [searchParams]);
+  useEffect(() => {
+    const n = searchParams.get("number");
+    if (n) setNumber(n);
+  }, [searchParams]);
 
   return (
     <div>
       <div className="mb-8">
         <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00] mb-2">Cek Status</div>
         <h1 className="font-display text-4xl tracking-tight uppercase">Status Registrasi</h1>
-        <p className="text-sm text-zinc-400 mt-2">Masukkan nomor registrasi yang Anda terima saat submit.</p>
+        <p className="text-sm text-zinc-400 mt-2">Masukkan nomor registrasi dan kode akses dari kartu sukses pendaftaran.</p>
       </div>
-      <div className="flex gap-2">
-        <Input value={number} onChange={(e) => setNumber(e.target.value)} placeholder="REG-EVENT-001" className="bg-[#0a0a0a] border-white/10" data-testid="check-number-input" />
-        <Button onClick={() => lookup()} disabled={busy} className="bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm uppercase tracking-[0.15em]" data-testid="check-lookup-btn">Cari</Button>
-      </div>
+      <form
+        onSubmit={(e) => { e.preventDefault(); lookup(); }}
+        className="grid grid-cols-1 md:grid-cols-2 gap-3"
+      >
+        <FieldRow label="Nomor Registrasi">
+          <Input value={number} onChange={(e) => setNumber(e.target.value)} placeholder="REG-EVENT-001" className="bg-[#0a0a0a] border-white/10" data-testid="check-number-input" autoComplete="off" />
+        </FieldRow>
+        <FieldRow label="Kode Akses">
+          <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="Kode dari kartu sukses" className="bg-[#0a0a0a] border-white/10" data-testid="check-code-input" autoComplete="off" />
+        </FieldRow>
+        <div className="md:col-span-2">
+          <Button type="submit" disabled={busy} className="bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm uppercase tracking-[0.15em]" data-testid="check-lookup-btn">Cari</Button>
+        </div>
+      </form>
 
       {data && (
         <div className="mt-6 border border-white/10 rounded-sm bg-[#0f0f10] p-6 space-y-4" data-testid="check-result">

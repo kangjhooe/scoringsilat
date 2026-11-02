@@ -54,8 +54,12 @@ export default function OperatorDashboard() {
 
   const del = async (id) => {
     if (!window.confirm("Hapus partai ini?")) return;
-    await api.delete(`/matches/${id}`);
-    loadAll();
+    try {
+      await api.delete(`/matches/${id}`);
+      loadAll();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
   };
 
   return (
@@ -170,7 +174,7 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
   const [form, setForm] = useState({
     arena_id: "", class_id: "", scoring_rule_id: "",
     red_athlete_id: "", blue_athlete_id: "", match_number: 1, round_label: "Babak Penyisihan",
-    discipline: "tanding", performer_ids: ["", ""],
+    discipline: "tanding", performer_ids: ["", ""], round_duration_sec: "",
   });
   const [busy, setBusy] = useState(false);
   const isTanding = form.discipline === "tanding";
@@ -188,6 +192,14 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
   };
 
   const create = async () => {
+    let roundDuration;
+    if (form.round_duration_sec !== "" && form.round_duration_sec !== null && form.round_duration_sec !== undefined) {
+      roundDuration = Number(form.round_duration_sec);
+      if (!Number.isFinite(roundDuration) || roundDuration < 1) {
+        toast.error("Durasi ronde minimal 1 detik, atau kosongkan untuk memakai aturan");
+        return;
+      }
+    }
     let payload;
     if (isTanding) {
       if (!form.red_athlete_id || !form.blue_athlete_id || form.red_athlete_id === form.blue_athlete_id) {
@@ -210,6 +222,8 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
         performer_ids: ids.slice(1),
       };
     }
+    delete payload.round_duration_sec;
+    if (roundDuration) payload.round_duration_sec = roundDuration;
     setBusy(true);
     try {
       await api.post("/matches", payload);
@@ -298,6 +312,18 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
           <div>
             <Label className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">Nomor Partai</Label>
             <Input type="number" value={form.match_number} onChange={(e) => setForm({ ...form, match_number: Number(e.target.value) || 1 })} className="bg-[#0a0a0a] border-white/10 mt-1" />
+          </div>
+          <div>
+            <Label className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">Durasi Ronde (detik, kosong = aturan)</Label>
+            <Input
+              type="number"
+              min={1}
+              value={form.round_duration_sec}
+              placeholder="Ikuti aturan"
+              onChange={(e) => setForm({ ...form, round_duration_sec: e.target.value })}
+              className="bg-[#0a0a0a] border-white/10 mt-1"
+              data-testid="match-round-duration-input"
+            />
           </div>
         </div>
         <DialogFooter>

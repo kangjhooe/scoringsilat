@@ -15,6 +15,7 @@ RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
 COPY server.py .
+COPY seed ./seed
 
 RUN mkdir -p /app/uploads \
     && useradd --create-home --shell /usr/sbin/nologin appuser \

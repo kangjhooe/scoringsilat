@@ -1,16 +1,17 @@
 """
 Phase 2 backend tests:
-- Self-registration (public, no auth) → REG-DEMO-NNN
+- Self-registration (public, no auth) → REG-{KODE}-NNN
 - Document upload validation (image/pdf accept, txt reject)
 - Admin status transitions + history[]
 - Quota enforcement on accepted
-- Convert-to-athlete (source='self_registration', PST-DEMO-NNN, contingent auto-create)
+- Convert-to-athlete (source='self_registration', PST-{KODE}-NNN, contingent auto-create)
 - Manual athlete creation still works + auto participant_number
 - WAHA config + test-connection / test-send error paths
 """
 import io
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 import requests
 
@@ -38,11 +39,18 @@ def operator_tok():
     return _login("operator@silat.id", "password123")
 
 
+def _event_code(ev):
+    return (ev.get("code") or ev.get("name") or "EVENT").upper().replace(" ", "")
+
+
 @pytest.fixture(scope="module")
 def demo_event(admin_tok):
     evs = requests.get(f"{API}/events", headers=H(admin_tok)).json()
-    ev = next((e for e in evs if (e.get("code") or "").upper() == "DEMO"), None)
-    assert ev, "DEMO event missing"
+    usable = [e for e in evs if e.get("status") != "closed" and e.get("registration_enabled") is not False]
+    ev = next((e for e in usable if (e.get("code") or "").upper() == "DEMO"), None)
+    if ev is None and usable:
+        ev = usable[0]
+    assert ev, "event missing"
     return ev
 
 
@@ -94,8 +102,9 @@ class TestPublicRegistration:
             assert r.status_code == 200, r.text
             body = r.json()
             assert body["status"] == "pending_verification"
+            assert isinstance(body.get("access_code"), str) and len(body["access_code"]) >= 6
             n = body["registration_number"]
-            assert n.startswith("REG-DEMO-"), n
+            assert n.startswith(f"REG-{_event_code(demo_event)}-"), n
             # Three digit suffix
             assert len(n.split("-")[-1]) == 3 and n.split("-")[-1].isdigit()
             nums.append(n)
@@ -110,18 +119,195 @@ class TestPublicRegistration:
         reg = TestPublicRegistration._last
         att = requests.post(
             f"{API}/public/registrations/{reg['id']}/files",
-            json={"registration_id": reg["id"], "label": "photo", "url": up["url"]},
+            json={"registration_id": reg["id"], "label": "photo", "url": up["url"], "access_code": reg["access_code"]},
         )
         assert att.status_code == 200, att.text
-        # by-number returns files + no admin_notes
-        by_num = requests.get(f"{API}/public/registrations/by-number/{reg['registration_number']}")
-        assert by_num.status_code == 200
-        data = by_num.json()
+        # lookup with number + code returns files, and hides admin notes and the code itself
+        looked = requests.post(
+            f"{API}/public/registrations/lookup",
+            json={"registration_number": reg["registration_number"], "access_code": reg["access_code"]},
+        )
+        assert looked.status_code == 200, looked.text
+        data = looked.json()
         assert "admin_notes" not in data
+        assert "access_code" not in data
+        assert data["name"] == reg["name"]
         assert any(f.get("label") == "photo" for f in data.get("files", []))
-        # by id also redacts
-        by_id = requests.get(f"{API}/public/registrations/{reg['id']}").json()
-        assert "admin_notes" not in by_id
+        # wrong code and unknown number share one message so numbers cannot be enumerated
+        wrong_code = requests.post(
+            f"{API}/public/registrations/lookup",
+            json={"registration_number": reg["registration_number"], "access_code": "kode-salah"},
+        )
+        wrong_number = requests.post(
+            f"{API}/public/registrations/lookup",
+            json={"registration_number": "REG-TIDAK-ADA-000", "access_code": reg["access_code"]},
+        )
+        assert wrong_code.status_code == 404
+        assert wrong_number.status_code == 404
+        assert wrong_code.json()["detail"] == wrong_number.json()["detail"]
+        blank_code = requests.post(
+            f"{API}/public/registrations/lookup",
+            json={"registration_number": reg["registration_number"], "access_code": "   "},
+        )
+        assert blank_code.status_code == 404
+        assert blank_code.json()["detail"] == wrong_number.json()["detail"]
+        assert reg["registration_number"] not in wrong_code.text
+        # number alone, or the old GET routes, no longer return the registration
+        for url in (
+            f"{API}/public/registrations/by-number/{reg['registration_number']}",
+            f"{API}/public/registrations/{reg['id']}",
+        ):
+            old = requests.get(url)
+            assert old.status_code in (404, 405)
+            if old.headers.get("content-type", "").startswith("application/json"):
+                payload = old.json()
+                if isinstance(payload, dict):
+                    assert payload.get("registration_number") != reg["registration_number"]
+                    assert payload.get("access_code") != reg["access_code"]
+
+    def test_committee_detail_returns_access_code(self, admin_tok, operator_tok):
+        reg = TestPublicRegistration._last
+        for tok in (admin_tok, operator_tok):
+            detail = requests.get(f"{API}/registrations/{reg['id']}", headers=H(tok))
+            assert detail.status_code == 200, detail.text
+            body = detail.json()
+            assert body.get("access_code") == reg["access_code"]
+            assert body.get("registration_number") == reg["registration_number"]
+
+
+def _local_db():
+    """Mongo used by a locally running API. Skip when the target is remote."""
+    from urllib.parse import urlparse
+    host = (urlparse(BASE_URL).hostname or "").lower()
+    if host not in ("localhost", "127.0.0.1"):
+        pytest.skip("legacy access-code backfill is checked against the local database")
+    try:
+        from dotenv import load_dotenv
+        from pymongo import MongoClient
+    except ImportError:
+        pytest.skip("pymongo or dotenv is not installed")
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+    url = os.environ.get("MONGO_URL")
+    name = os.environ.get("DB_NAME")
+    if not url or not name:
+        pytest.skip("MONGO_URL or DB_NAME is missing")
+    return MongoClient(url)[name]
+
+
+class TestLegacyAccessCode:
+    def test_opening_detail_mints_code_once(self, admin_tok, operator_tok, demo_event):
+        db = _local_db()
+        created = requests.post(f"{API}/public/registrations", json={
+            "event_id": demo_event["id"],
+            "contingent_name": "TEST_LegacyCont",
+            "name": f"TEST_Legacy_{int(time.time())}",
+            "gender": "putri",
+        })
+        assert created.status_code == 200, created.text
+        reg = created.json()
+        original = reg["access_code"]
+        try:
+            db.registrations.update_one({"id": reg["id"]}, {"$unset": {"access_code": ""}})
+            detail = requests.get(f"{API}/registrations/{reg['id']}", headers=H(operator_tok))
+            assert detail.status_code == 200, detail.text
+            code = detail.json().get("access_code")
+            assert isinstance(code, str) and len(code) >= 6
+            assert code != original
+            again = requests.get(f"{API}/registrations/{reg['id']}", headers=H(operator_tok)).json()
+            assert again.get("access_code") == code
+            ok = requests.post(f"{API}/public/registrations/lookup", json={
+                "registration_number": reg["registration_number"],
+                "access_code": code,
+            })
+            assert ok.status_code == 200, ok.text
+            assert "access_code" not in ok.json()
+            stale = requests.post(f"{API}/public/registrations/lookup", json={
+                "registration_number": reg["registration_number"],
+                "access_code": original,
+            })
+            unknown = requests.post(f"{API}/public/registrations/lookup", json={
+                "registration_number": "REG-TIDAK-ADA-000",
+                "access_code": code,
+            })
+            assert stale.status_code == 404
+            assert unknown.status_code == 404
+            assert stale.json()["detail"] == unknown.json()["detail"]
+        finally:
+            requests.delete(f"{API}/registrations/{reg['id']}", headers=H(admin_tok))
+
+
+PUBLIC_ATHLETE_KEYS = {"id", "name", "photo_url", "gender", "weight", "contingent_id"}
+
+
+class TestPublicAthleteRedaction:
+    def test_public_list_and_bracket_hide_private_fields(self, admin_tok, demo_event):
+        h = H(admin_tok)
+        eid = demo_event["id"]
+        phone = "081199988877"
+        cont = requests.post(f"{API}/contingents", headers=h, json={"event_id": eid, "name": f"TEST_RedactCont_{int(time.time())}"}).json()
+        cat = requests.post(f"{API}/categories", headers=h, json={"event_id": eid, "name": "TEST_RedactCat", "type": "tanding", "gender": "putra"}).json()
+        cls = requests.post(f"{API}/classes", headers=h, json={"event_id": eid, "category_id": cat["id"], "name": "TEST_RedactCls"}).json()
+        ath = requests.post(f"{API}/athletes", headers=h, json={
+            "event_id": eid,
+            "contingent_id": cont["id"],
+            "category_id": cat["id"],
+            "class_id": cls["id"],
+            "name": f"TEST_RedactAth_{int(time.time())}",
+            "gender": "putra",
+            "weight": 52,
+            "dob": "2001-02-03",
+            "phone": phone,
+            "photo_url": "",
+            "registration_id": "reg-rahasia",
+        }).json()
+        bracket = requests.post(f"{API}/brackets", headers=h, json={
+            "event_id": eid,
+            "category_id": cat["id"],
+            "class_id": cls["id"],
+            "name": "TEST_RedactBracket",
+            "size": 4,
+            "auto_fill": False,
+        }).json()
+        try:
+            listed = requests.get(f"{API}/public/athletes", params={"event_id": eid})
+            assert listed.status_code == 200, listed.text
+            rows = listed.json()
+            assert rows, "public athlete list is empty"
+            for row in rows:
+                assert set(row.keys()) == PUBLIC_ATHLETE_KEYS
+                assert "phone" not in row and "dob" not in row and "registration_id" not in row
+            found = next(a for a in rows if a["id"] == ath["id"])
+            assert found["name"] == ath["name"]
+            assert found["weight"] == 52
+            assert found["gender"] == "putra"
+            assert found["contingent_id"] == cont["id"]
+            private = requests.get(f"{API}/athletes", headers=h, params={"event_id": eid}).json()
+            private_row = next(a for a in private if a["id"] == ath["id"])
+            assert private_row.get("phone") == phone
+            assert private_row.get("dob") == "2001-02-03"
+
+            slot = next(s for s in bracket["slots"] if s.get("round") == 1 and s.get("position") == 0)
+            assigned = requests.put(
+                f"{API}/brackets/{bracket['id']}/slots/{slot['id']}",
+                headers=h,
+                json={"athlete_id": ath["id"]},
+            )
+            assert assigned.status_code == 200, assigned.text
+            admin_ath = next(s["athlete"] for s in assigned.json()["slots"] if (s.get("athlete") or {}).get("id") == ath["id"])
+            assert admin_ath.get("phone") == phone
+            public_bracket = requests.get(f"{API}/public/brackets/{bracket['id']}")
+            assert public_bracket.status_code == 200, public_bracket.text
+            public_ath = next(s["athlete"] for s in public_bracket.json()["slots"] if (s.get("athlete") or {}).get("id") == ath["id"])
+            assert set(public_ath.keys()) == PUBLIC_ATHLETE_KEYS
+            assert public_ath["name"] == ath["name"]
+            assert public_ath["weight"] == 52
+            assert "phone" not in public_ath and "dob" not in public_ath and "registration_id" not in public_ath
+        finally:
+            requests.delete(f"{API}/brackets/{bracket['id']}", headers=h)
+            requests.delete(f"{API}/athletes/{ath['id']}", headers=h)
+            requests.delete(f"{API}/classes/{cls['id']}", headers=h)
+            requests.delete(f"{API}/categories/{cat['id']}", headers=h)
+            requests.delete(f"{API}/contingents/{cont['id']}", headers=h)
 
 
 # ===================== Admin list / status transitions =====================
@@ -205,6 +391,292 @@ class TestQuota:
             requests.delete(f"{API}/classes/{cls['id']}", headers=h)
             requests.delete(f"{API}/categories/{cat['id']}", headers=h)
 
+    def test_category_quota_and_releasing_slot(self, admin_tok, demo_event):
+        h = H(admin_tok)
+        eid = demo_event["id"]
+        cat = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": eid, "name": "TEST_CatQuota", "type": "tanding", "gender": "putra", "quota": 1,
+        }).json()
+        cls = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": eid, "category_id": cat["id"], "name": "TEST_CatQuotaCls", "quota": 0,
+        }).json()
+        reg_ids = []
+        try:
+            for i in range(2):
+                created = requests.post(f"{API}/public/registrations", json={
+                    "event_id": eid,
+                    "category_id": cat["id"],
+                    "class_id": cls["id"],
+                    "contingent_name": f"TEST_CatQuotaCont_{i}",
+                    "name": f"TEST_CatQuota_{time.time_ns()}_{i}",
+                    "gender": "putra",
+                })
+                assert created.status_code == 200, created.text
+                reg_ids.append(created.json()["id"])
+                verified = requests.post(f"{API}/registrations/{reg_ids[-1]}/status", headers=h, json={"status": "verified"})
+                assert verified.status_code == 200, verified.text
+            first = requests.post(f"{API}/registrations/{reg_ids[0]}/status", headers=h, json={"status": "accepted"})
+            assert first.status_code == 200, first.text
+            blocked = requests.post(f"{API}/registrations/{reg_ids[1]}/status", headers=h, json={"status": "accepted"})
+            assert blocked.status_code == 400
+            assert "kategori" in blocked.text.lower()
+            freed = requests.post(f"{API}/registrations/{reg_ids[0]}/status", headers=h, json={"status": "reserve"})
+            assert freed.status_code == 200, freed.text
+            second = requests.post(f"{API}/registrations/{reg_ids[1]}/status", headers=h, json={"status": "accepted"})
+            assert second.status_code == 200, second.text
+        finally:
+            for rid in reg_ids:
+                requests.delete(f"{API}/registrations/{rid}", headers=h)
+            requests.delete(f"{API}/classes/{cls['id']}", headers=h)
+            requests.delete(f"{API}/categories/{cat['id']}", headers=h)
+
+    def test_convert_does_not_consume_a_second_slot(self, admin_tok, demo_event):
+        h = H(admin_tok)
+        eid = demo_event["id"]
+        cat = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": eid, "name": "TEST_ConvertQuota", "type": "tanding", "gender": "putra",
+        }).json()
+        cls = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": eid, "category_id": cat["id"], "name": "TEST_ConvertQuotaCls", "quota": 1,
+        }).json()
+        reg_ids = []
+        athlete_id = None
+        try:
+            for i in range(2):
+                created = requests.post(f"{API}/public/registrations", json={
+                    "event_id": eid,
+                    "category_id": cat["id"],
+                    "class_id": cls["id"],
+                    "contingent_name": f"TEST_ConvertSlot_{time.time_ns()}_{i}",
+                    "name": f"TEST_ConvertSlot_{time.time_ns()}_{i}",
+                    "gender": "putra",
+                })
+                assert created.status_code == 200, created.text
+                reg_ids.append(created.json()["id"])
+                requests.post(f"{API}/registrations/{reg_ids[-1]}/status", headers=h, json={"status": "verified"})
+            accepted = requests.post(f"{API}/registrations/{reg_ids[0]}/status", headers=h, json={"status": "accepted"})
+            assert accepted.status_code == 200, accepted.text
+            converted = requests.post(f"{API}/registrations/{reg_ids[0]}/convert-to-athlete", headers=h)
+            assert converted.status_code == 200, converted.text
+            athlete_id = converted.json()["athlete"]["id"]
+            assert converted.json()["athlete"]["source"] == "self_registration"
+            blocked = requests.post(f"{API}/registrations/{reg_ids[1]}/status", headers=h, json={"status": "accepted"})
+            assert blocked.status_code == 400
+            assert "kuota" in blocked.text.lower()
+        finally:
+            if athlete_id:
+                requests.delete(f"{API}/athletes/{athlete_id}", headers=h)
+            for rid in reg_ids:
+                requests.delete(f"{API}/registrations/{rid}", headers=h)
+            requests.delete(f"{API}/classes/{cls['id']}", headers=h)
+            requests.delete(f"{API}/categories/{cat['id']}", headers=h)
+
+    def test_moving_class_moves_the_slot(self, admin_tok, demo_event):
+        h = H(admin_tok)
+        eid = demo_event["id"]
+        cat = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": eid, "name": "TEST_MoveQuota", "type": "tanding", "gender": "putra",
+        }).json()
+        class_a = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": eid, "category_id": cat["id"], "name": "TEST_MoveA", "quota": 1,
+        }).json()
+        class_b = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": eid, "category_id": cat["id"], "name": "TEST_MoveB", "quota": 1,
+        }).json()
+        reg_ids = []
+        try:
+            def make(class_id, label):
+                created = requests.post(f"{API}/public/registrations", json={
+                    "event_id": eid,
+                    "category_id": cat["id"],
+                    "class_id": class_id,
+                    "contingent_name": f"TEST_Move_{label}",
+                    "name": f"TEST_Move_{label}_{time.time_ns()}",
+                    "gender": "putra",
+                })
+                assert created.status_code == 200, created.text
+                rid = created.json()["id"]
+                reg_ids.append(rid)
+                assert requests.post(f"{API}/registrations/{rid}/status", headers=h, json={"status": "verified"}).status_code == 200
+                return rid
+
+            first = make(class_a["id"], "a")
+            second = make(class_a["id"], "b")
+            assert requests.post(f"{API}/registrations/{first}/status", headers=h, json={"status": "accepted"}).status_code == 200
+            blocked = requests.post(f"{API}/registrations/{second}/status", headers=h, json={"status": "accepted"})
+            assert blocked.status_code == 400
+            moved = requests.put(f"{API}/registrations/{first}", headers=h, json={
+                "event_id": eid,
+                "category_id": cat["id"],
+                "class_id": class_b["id"],
+                "contingent_name": "TEST_Move_a",
+                "name": "TEST_Move_a_edited",
+                "gender": "putra",
+            })
+            assert moved.status_code == 200, moved.text
+            assert moved.json()["class_id"] == class_b["id"]
+            opened = requests.post(f"{API}/registrations/{second}/status", headers=h, json={"status": "accepted"})
+            assert opened.status_code == 200, opened.text
+            third = make(class_b["id"], "c")
+            still_full = requests.post(f"{API}/registrations/{third}/status", headers=h, json={"status": "accepted"})
+            assert still_full.status_code == 400
+        finally:
+            for rid in reg_ids:
+                requests.delete(f"{API}/registrations/{rid}", headers=h)
+            requests.delete(f"{API}/classes/{class_a['id']}", headers=h)
+            requests.delete(f"{API}/classes/{class_b['id']}", headers=h)
+            requests.delete(f"{API}/categories/{cat['id']}", headers=h)
+
+    def test_concurrent_accept_cannot_pass_quota(self, admin_tok, demo_event):
+        h = H(admin_tok)
+        eid = demo_event["id"]
+        cat = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": eid, "name": "TEST_RaceQuota", "type": "tanding", "gender": "putra",
+        }).json()
+        cls = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": eid, "category_id": cat["id"], "name": "TEST_RaceCls", "quota": 1,
+        }).json()
+        reg_ids = []
+        try:
+            for i in range(2):
+                created = requests.post(f"{API}/public/registrations", json={
+                    "event_id": eid,
+                    "category_id": cat["id"],
+                    "class_id": cls["id"],
+                    "contingent_name": f"TEST_Race_{i}",
+                    "name": f"TEST_Race_{time.time_ns()}_{i}",
+                    "gender": "putra",
+                })
+                assert created.status_code == 200, created.text
+                rid = created.json()["id"]
+                reg_ids.append(rid)
+                assert requests.post(f"{API}/registrations/{rid}/status", headers=h, json={"status": "verified"}).status_code == 200
+
+            def accept(rid):
+                return requests.post(f"{API}/registrations/{rid}/status", headers=h, json={"status": "accepted"}, timeout=20)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(accept, reg_ids))
+            assert sorted(r.status_code for r in results) == [200, 400]
+            statuses = [
+                requests.get(f"{API}/registrations/{rid}", headers=h).json()["status"]
+                for rid in reg_ids
+            ]
+            assert sorted(statuses) == ["accepted", "verified"]
+        finally:
+            for rid in reg_ids:
+                requests.delete(f"{API}/registrations/{rid}", headers=h)
+            requests.delete(f"{API}/classes/{cls['id']}", headers=h)
+            requests.delete(f"{API}/categories/{cat['id']}", headers=h)
+
+
+# ===================== Placement and field length =====================
+class TestRegistrationPlacement:
+    def test_blank_category_and_class_still_register(self, demo_event):
+        created = requests.post(f"{API}/public/registrations", json={
+            "event_id": demo_event["id"],
+            "category_id": "",
+            "class_id": "",
+            "contingent_name": "TEST_BlankIds",
+            "name": f"TEST_BlankIds_{time.time_ns()}",
+            "gender": "putra",
+        })
+        assert created.status_code == 200, created.text
+        requests.delete(f"{API}/registrations/{created.json()['id']}", headers=H(_login("admin@silat.id", "admin123")))
+
+    def test_gender_must_match_category_except_campuran(self, admin_tok, demo_event):
+        h = H(admin_tok)
+        eid = demo_event["id"]
+        putri = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": eid, "name": "TEST_Putri", "type": "tanding", "gender": "putri",
+        }).json()
+        campuran = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": eid, "name": "TEST_Campuran", "type": "ganda", "gender": "campuran",
+        }).json()
+        other = requests.post(f"{API}/events", headers=h, json={"name": "TEST_EventLain", "location": "Solo"}).json()
+        other_cat = requests.post(f"{API}/categories", headers=h, json={
+            "event_id": other["id"], "name": "TEST_EventLainCat", "type": "tanding", "gender": "putra",
+        }).json()
+        own_class = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": eid, "category_id": putri["id"], "name": "TEST_PutriClass",
+        }).json()
+        other_class = requests.post(f"{API}/classes", headers=h, json={
+            "event_id": other["id"], "category_id": other_cat["id"], "name": "TEST_EventLainClass",
+        }).json()
+        created_ids = []
+        try:
+            mismatch = requests.post(f"{API}/public/registrations", json={
+                "event_id": eid, "category_id": putri["id"], "contingent_name": "TEST_Gender",
+                "name": f"TEST_Gender_{time.time_ns()}", "gender": "putra",
+            })
+            assert mismatch.status_code == 400
+            assert "gender" in mismatch.text.lower()
+            foreign_cat = requests.post(f"{API}/public/registrations", json={
+                "event_id": eid, "category_id": other_cat["id"], "contingent_name": "TEST_Foreign",
+                "name": f"TEST_ForeignCat_{time.time_ns()}", "gender": "putra",
+            })
+            assert foreign_cat.status_code == 400
+            assert "kategori" in foreign_cat.text.lower()
+            foreign_class = requests.post(f"{API}/public/registrations", json={
+                "event_id": eid, "category_id": putri["id"], "class_id": other_class["id"],
+                "contingent_name": "TEST_ForeignCls", "name": f"TEST_ForeignCls_{time.time_ns()}", "gender": "putri",
+            })
+            assert foreign_class.status_code == 400
+            wrong_pair = requests.post(f"{API}/public/registrations", json={
+                "event_id": eid, "category_id": campuran["id"], "class_id": own_class["id"],
+                "contingent_name": "TEST_WrongPair", "name": f"TEST_WrongPair_{time.time_ns()}", "gender": "putra",
+            })
+            assert wrong_pair.status_code == 400
+            assert "kelas" in wrong_pair.text.lower()
+            for gender in ("putra", "putri"):
+                ok = requests.post(f"{API}/public/registrations", json={
+                    "event_id": eid, "category_id": campuran["id"], "contingent_name": "TEST_Mix",
+                    "name": f"TEST_Mix_{gender}_{time.time_ns()}", "gender": gender,
+                })
+                assert ok.status_code == 200, ok.text
+                created_ids.append(ok.json()["id"])
+            matched = requests.post(f"{API}/public/registrations", json={
+                "event_id": eid, "category_id": putri["id"], "class_id": own_class["id"],
+                "contingent_name": "TEST_Match", "name": f"TEST_Match_{time.time_ns()}", "gender": "putri",
+            })
+            assert matched.status_code == 200, matched.text
+            created_ids.append(matched.json()["id"])
+        finally:
+            for rid in created_ids:
+                requests.delete(f"{API}/registrations/{rid}", headers=h)
+            requests.delete(f"{API}/classes/{own_class['id']}", headers=h)
+            requests.delete(f"{API}/categories/{putri['id']}", headers=h)
+            requests.delete(f"{API}/categories/{campuran['id']}", headers=h)
+            requests.delete(f"{API}/events/{other['id']}", headers=h)
+
+    def test_field_length_limits(self, demo_event):
+        base = {
+            "event_id": demo_event["id"],
+            "contingent_name": "TEST_Len",
+            "gender": "putra",
+        }
+        too_long = requests.post(f"{API}/public/registrations", json={**base, "name": "A" * 121})
+        assert too_long.status_code == 422
+        assert "Nama" in too_long.text
+        too_phone = requests.post(f"{API}/public/registrations", json={**base, "name": "TEST_Phone", "phone": "1" * 33})
+        assert too_phone.status_code == 422
+        assert "Telepon" in too_phone.text
+        too_email = requests.post(f"{API}/public/registrations", json={**base, "name": "TEST_Email", "email": "a" * 255})
+        assert too_email.status_code == 422
+        assert "Email" in too_email.text
+        too_address = requests.post(f"{API}/public/registrations", json={**base, "name": "TEST_Addr", "address": "J" * 501})
+        assert too_address.status_code == 422
+        assert "Alamat" in too_address.text
+        ok = requests.post(f"{API}/public/registrations", json={
+            **base,
+            "name": "N" * 120,
+            "phone": "8" * 32,
+            "email": "e" * 254,
+            "address": "A" * 500,
+        })
+        assert ok.status_code == 200, ok.text
+        requests.delete(f"{API}/registrations/{ok.json()['id']}", headers=H(_login("admin@silat.id", "admin123")))
+
 
 # ===================== Convert to athlete =====================
 class TestConvert:
@@ -231,7 +703,7 @@ class TestConvert:
         ath = data["athlete"]
         assert ath["source"] == "self_registration"
         assert ath["registration_id"] == rid
-        assert ath["participant_number"].startswith("PST-DEMO-")
+        assert ath["participant_number"].startswith(f"PST-{_event_code(demo_event)}-")
         assert ath["status"] == "active"
         # Registration now active_participant
         reg_after = requests.get(f"{API}/registrations/{rid}", headers=h).json()
@@ -282,7 +754,7 @@ class TestManualAthlete:
         assert ath.status_code == 200, ath.text
         body = ath.json()
         assert body.get("source", "manual") == "manual"
-        assert body["participant_number"].startswith("PST-DEMO-")
+        assert body["participant_number"].startswith(f"PST-{_event_code(demo_event)}-")
         requests.delete(f"{API}/athletes/{body['id']}", headers=h)
         if cleanup_cont:
             requests.delete(f"{API}/contingents/{cid}", headers=h)

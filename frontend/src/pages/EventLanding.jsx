@@ -20,7 +20,7 @@ import {
   Users,
 } from "lucide-react";
 
-const FALLBACK_HERO = "/assets/silat-event-hero.png";
+const FALLBACK_HERO = "/assets/silat-event-hero2.jpeg";
 
 export function EventHome() {
   const [events, setEvents] = useState([]);

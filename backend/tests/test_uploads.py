@@ -67,7 +67,7 @@ def test_upload_photo_admin_png(admin_token):
 
 # ----- upload OK (operator) -----
 def test_upload_photo_operator_jpg(operator_token):
-    payload = b"\xff\xd8\xff\xe0" + b"\x00" * 100  # minimal JPEG-ish bytes; backend only checks ext
+    payload = b"\xff\xd8\xff\xe0" + b"\x00" * 100  # JPEG start-of-image marker; content sniff accepts it
     files = {"file": ("photo.jpg", io.BytesIO(payload), "image/jpeg")}
     r = requests.post(f"{API}/uploads/photo", headers={"Authorization": f"Bearer {operator_token}"}, files=files)
     assert r.status_code == 200, r.text

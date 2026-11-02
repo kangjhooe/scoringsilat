@@ -78,6 +78,48 @@ update_env "ADMIN_PASSWORD" "${ADMIN_PASSWORD_INPUT}"
 
 docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d --force-recreate backend
 
+echo "Menunggu backend siap..."
+ready=0
+for _ in $(seq 1 30); do
+  if docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" exec -T backend \
+    curl -fsS "http://localhost:8000/api/" >/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+if [[ "${ready}" -ne 1 ]]; then
+  echo "Backend belum siap. Password di .env.production sudah diubah, tetapi database belum diperbarui."
+  exit 1
+fi
+
+echo "Menulis kata sandi baru ke database..."
+docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" exec -T backend python - <<'PY'
+import asyncio
+import os
+import bcrypt
+from motor.motor_asyncio import AsyncIOMotorClient
+
+async def main():
+    email = os.environ.get("ADMIN_EMAIL", "admin@silat.id").strip()
+    password = os.environ.get("ADMIN_PASSWORD", "")
+    if len(password) < 8:
+        raise SystemExit("ADMIN_PASSWORD terlalu pendek")
+    client = AsyncIOMotorClient(os.environ["MONGO_URL"])
+    try:
+        database = client[os.environ["DB_NAME"]]
+        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        result = await database.users.update_one({"email": email}, {"$set": {"password_hash": hashed}})
+        if result.matched_count == 0 and email.lower() != email:
+            result = await database.users.update_one({"email": email.lower()}, {"$set": {"password_hash": hashed}})
+        if result.matched_count == 0:
+            raise SystemExit(f"Akun admin {email} belum ada di database")
+    finally:
+        client.close()
+
+asyncio.run(main())
+PY
+
 echo
 echo "Password admin sudah direset."
 echo "Login dengan:"

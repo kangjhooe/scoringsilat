@@ -5,23 +5,31 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import os
+import io
 import re
 import uuid
 import json
+import hmac
+import secrets
 import logging
 import asyncio
+import ipaddress
+import threading
+import time
 import bcrypt
 import jwt
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any, Literal
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect, status, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect, status, UploadFile, File, Form
+from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from pymongo.errors import DuplicateKeyError
+from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator
 
 # ============ Config ============
 mongo_url = os.environ["MONGO_URL"]
@@ -31,14 +39,36 @@ JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@silat.id")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+MIN_PASSWORD_LENGTH = 8
 
 client = AsyncIOMotorClient(mongo_url)
 db = client[db_name]
 
 UPLOAD_DIR = ROOT_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# KTP dan surat sehat. Folder ini tidak dilayani lewat /api/uploads.
+PRIVATE_UPLOAD_DIR = UPLOAD_DIR / "private"
+PRIVATE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+PRIVATE_DOC_LABELS = frozenset({"ktp", "surat_sehat"})
 ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+ALLOWED_DOC_EXT = ALLOWED_IMAGE_EXT | {".pdf"}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5MB
+MAX_REGISTRATION_FILES = 10
+# In-process caps. A registration desk can still submit many forms; a script cannot flood the disk or guess codes.
+PUBLIC_UPLOAD_LIMIT = 100
+PUBLIC_UPLOAD_WINDOW_SEC = 600
+PUBLIC_LOOKUP_LIMIT = 40
+PUBLIC_LOOKUP_WINDOW_SEC = 600
+LOGIN_LIMIT = 10
+LOGIN_WINDOW_SEC = 300
+PUBLIC_REGISTRATION_LIMIT = 10
+PUBLIC_REGISTRATION_WINDOW_SEC = 600
+_UPLOAD_READ_CHUNK = 64 * 1024
+# Docker's default bridge address pool. nginx on that network is the only peer allowed to set X-Real-IP.
+_DOCKER_PEER_NETS = (ipaddress.ip_network("172.16.0.0/12"),)
+_UPLOAD_URL_RE = re.compile(r"^/api/uploads/([A-Za-z0-9][A-Za-z0-9._-]{0,180})$")
+_PRIVATE_URL_RE = re.compile(r"^/api/private-uploads/([A-Za-z0-9][A-Za-z0-9._-]{0,180})$")
+_PUBLIC_MATCH_HIDDEN = ("pending_votes", "approval_notes")
 
 app = FastAPI(title="Silat Scoring API")
 api = APIRouter(prefix="/api")
@@ -54,6 +84,22 @@ def now_iso() -> str:
 def new_id() -> str:
     return str(uuid.uuid4())
 
+def _match_round_duration(match: Optional[Dict[str, Any]], rule: Optional[Dict[str, Any]]) -> int:
+    """Partai may override the rule. An empty value keeps the rule duration."""
+    raw = (match or {}).get("round_duration_sec")
+    if raw not in (None, ""):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    try:
+        fallback = int((rule or {}).get("round_duration_sec") or 120)
+    except (TypeError, ValueError):
+        return 120
+    return fallback if fallback > 0 else 120
+
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
@@ -62,6 +108,14 @@ def verify_password(pw: str, hashed: str) -> bool:
         return bcrypt.checkpw(pw.encode(), hashed.encode())
     except Exception:
         return False
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+def _check_new_password(value: str) -> str:
+    if len(value or "") < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Kata sandi minimal {MIN_PASSWORD_LENGTH} karakter")
+    return value
 
 def create_token(user_id: str, role: str) -> str:
     payload = {
@@ -91,11 +145,23 @@ class RegisterIn(BaseModel):
     name: str
     role: str
 
+    @field_validator("password")
+    @classmethod
+    def _password_len(cls, value: str) -> str:
+        return _check_new_password(value)
+
 class UserUpdateIn(BaseModel):
     email: Optional[EmailStr] = None
     password: Optional[str] = None
     name: Optional[str] = None
     role: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def _password_len(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or value == "":
+            return value
+        return _check_new_password(value)
 
 class LoginIn(BaseModel):
     email: EmailStr
@@ -168,6 +234,8 @@ class ScoringRuleIn(BaseModel):
     round_count: int = 3
     round_duration_sec: int = 120
     rest_duration_sec: int = 60
+    jury_consensus_window_sec: int = Field(default=2, ge=1, le=10)
+    technical_win_margin: int = Field(default=0, ge=0)
     points: Dict[str, int] = Field(default_factory=lambda: {"pukulan": 1, "tendangan": 2, "jatuhan": 3})
     penalty_points: Dict[str, int] = Field(default_factory=lambda: {"teguran_1": 1, "teguran_2": 2, "peringatan_1": 5, "peringatan_2": 10, "peringatan_3": 0})
     binaan_limit: int = 2
@@ -188,6 +256,16 @@ class MatchIn(BaseModel):
     round_label: str = "Babak Penyisihan"
     bracket_id: Optional[str] = None
     bracket_slot_id: Optional[str] = None  # parent slot to advance winner into
+    round_duration_sec: Optional[int] = None
+
+    @field_validator("round_duration_sec")
+    @classmethod
+    def _round_duration_positive(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if value < 1:
+            raise ValueError("Durasi ronde minimal 1 detik")
+        return value
 
 class ScoreActionIn(BaseModel):
     corner: Literal["red", "blue"]
@@ -249,6 +327,20 @@ REGISTRATION_STATUSES = {
     "active_participant",
 }
 
+REGISTRATION_NAME_MAX = 120
+REGISTRATION_PHONE_MAX = 32
+REGISTRATION_EMAIL_MAX = 254
+REGISTRATION_ADDRESS_MAX = 500
+OCCUPIED_REGISTRATION_STATUSES = ("accepted", "active_participant")
+
+
+def _bounded_text(value: Optional[str], limit: int, label: str) -> str:
+    text = "" if value is None else str(value)
+    if len(text) > limit:
+        raise ValueError(f"{label} maksimal {limit} karakter")
+    return text
+
+
 class RegistrationIn(BaseModel):
     event_id: str
     category_id: Optional[str] = None
@@ -264,6 +356,26 @@ class RegistrationIn(BaseModel):
     address: str = ""
     photo_url: str = ""
 
+    @field_validator("name")
+    @classmethod
+    def _limit_name(cls, value: str) -> str:
+        return _bounded_text(value, REGISTRATION_NAME_MAX, "Nama")
+
+    @field_validator("phone")
+    @classmethod
+    def _limit_phone(cls, value: str) -> str:
+        return _bounded_text(value, REGISTRATION_PHONE_MAX, "Telepon")
+
+    @field_validator("email")
+    @classmethod
+    def _limit_email(cls, value: str) -> str:
+        return _bounded_text(value, REGISTRATION_EMAIL_MAX, "Email")
+
+    @field_validator("address")
+    @classmethod
+    def _limit_address(cls, value: str) -> str:
+        return _bounded_text(value, REGISTRATION_ADDRESS_MAX, "Alamat")
+
 class RegistrationUpdateStatusIn(BaseModel):
     status: Literal[
         "pending_verification", "need_revision", "verification_rejected",
@@ -275,6 +387,11 @@ class RegistrationFileIn(BaseModel):
     registration_id: str
     label: str  # "photo", "ktp", "surat_sehat", etc.
     url: str
+    access_code: str = ""
+
+class RegistrationLookupIn(BaseModel):
+    registration_number: str = ""
+    access_code: str = ""
 
 class WAHAConfigIn(BaseModel):
     base_url: str = ""
@@ -349,6 +466,15 @@ manager = WSManager()
 # ============ Helpers: Match computation ============
 JURY_CONSENSUS_WINDOW_SEC = 2
 _consensus_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _consensus_window_sec(rule: Optional[Dict[str, Any]]) -> int:
+    raw = (rule or {}).get("jury_consensus_window_sec", JURY_CONSENSUS_WINDOW_SEC)
+    try:
+        window = int(raw)
+    except (TypeError, ValueError):
+        window = JURY_CONSENSUS_WINDOW_SEC
+    return min(10, max(1, window))
 _expire_task: Optional[asyncio.Task] = None
 
 
@@ -429,7 +555,7 @@ async def compute_match_state(match_id: str) -> Dict[str, Any]:
         match["winner_corner"] = saved_winner
         match["decision_method"] = saved_method
 
-    window_start = (datetime.now(timezone.utc) - timedelta(seconds=JURY_CONSENSUS_WINDOW_SEC)).isoformat()
+    window_start = (datetime.now(timezone.utc) - timedelta(seconds=_consensus_window_sec(rule))).isoformat()
     pending_votes = await db.score_votes.find(
         {"match_id": match_id, "log_id": None, "timestamp": {"$gte": window_start}},
         {"_id": 0},
@@ -461,7 +587,13 @@ async def settle_expired_timer(match: Dict[str, Any]) -> Dict[str, Any]:
     remaining = float(timer.get("remaining_sec") or 0) - (now - started).total_seconds()
     if remaining > 0:
         return match
-    stopped = {"running": False, "remaining_sec": 0, "started_at": None, "round": timer.get("round", match.get("current_round", 1))}
+    stopped = {
+        "running": False,
+        "remaining_sec": 0,
+        "started_at": None,
+        "round": timer.get("round", match.get("current_round", 1)),
+        "phase": timer.get("phase") or "round",
+    }
     await db.matches.update_one({"id": match["id"]}, {"$set": {"timer": stopped, "status": "paused"}})
     updated = dict(match)
     updated["timer"] = stopped
@@ -502,20 +634,59 @@ async def _finish_match_decision(match: Dict[str, Any], winner_corner: str, deci
         "finished_at": now.isoformat(),
         "timer": timer,
     }})
+    match["status"] = "finished"
+    match["winner_corner"] = winner_corner
+    match["decision_method"] = decision_method
+    match["timer"] = timer
+
+
+async def _maybe_technical_win(match: Dict[str, Any], rule: Dict[str, Any], log_id: str) -> bool:
+    """Finish the match when the score gap reaches a configured margin above 0."""
+    if (match.get("discipline") or "tanding") != "tanding":
+        return False
+    if match.get("status") in ("finished", "approved"):
+        return False
+    try:
+        margin = int(rule.get("technical_win_margin") or 0)
+    except (TypeError, ValueError):
+        margin = 0
+    if margin <= 0:
+        return False
+    state = await compute_match_state(match["id"])
+    red_score = int((state.get("red") or {}).get("score") or 0)
+    blue_score = int((state.get("blue") or {}).get("score") or 0)
+    if abs(red_score - blue_score) < margin or red_score == blue_score:
+        return False
+    winner = "red" if red_score > blue_score else "blue"
+    await db.score_logs.update_one({"id": log_id}, {"$set": {"technical_win": True}})
+    await _finish_match_decision(match, winner, "menang_teknik")
+    return True
+
+def redact_public_match(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Drop jury-only fields before a payload leaves the public API or public sockets."""
+    if not state:
+        return {}
+    out = dict(state)
+    for key in _PUBLIC_MATCH_HIDDEN:
+        out.pop(key, None)
+    return out
 
 async def broadcast_match_update(match_id: str, event_type: str = "update"):
     state = await compute_match_state(match_id)
     if not state:
         return
+    full = {"type": event_type, "match_id": match_id, "state": state}
+    public = {"type": event_type, "match_id": match_id, "state": redact_public_match(state)}
     arena_id = state.get("arena_id")
-    payload = {"type": event_type, "match_id": match_id, "state": state}
     if arena_id:
-        await manager.broadcast(f"arena:{arena_id}", payload)
-    await manager.broadcast(f"match:{match_id}", payload)
+        await manager.broadcast(f"arena:{arena_id}", public)
+    await manager.broadcast(f"public:{match_id}", public)
+    await manager.broadcast(f"match:{match_id}", full)
 
 # ============ Routes: Auth ============
 @api.post("/auth/login")
-async def login(data: LoginIn):
+async def login(data: LoginIn, request: Request):
+    enforce_rate_limit(request, "login", LOGIN_LIMIT, LOGIN_WINDOW_SEC)
     email = data.email.lower()
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(data.password, user["password_hash"]):
@@ -589,43 +760,147 @@ async def update_user(user_id: str, data: UserUpdateIn, user=Depends(require_rol
     out = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
     return out
 
+# ============ Upload bytes, client IP, and in-process rate limits ============
+def _coerce_ip(value: str):
+    raw = (value or "").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    raw = raw.split("%", 1)[0].strip()
+    if not raw:
+        return None
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+def _is_docker_peer(host: str) -> bool:
+    ip = _coerce_ip(host)
+    if not isinstance(ip, ipaddress.IPv4Address):
+        return False
+    return any(ip in net for net in _DOCKER_PEER_NETS)
+
+def client_ip(request: Request) -> str:
+    """Real client address. Trust X-Real-IP only when the TCP peer is on the Docker network."""
+    peer = request.client.host if request.client and request.client.host else ""
+    if _is_docker_peer(peer):
+        forwarded = _coerce_ip(request.headers.get("x-real-ip") or "")
+        if forwarded is not None:
+            return str(forwarded)
+    return peer or "unknown"
+
+_rate_lock = threading.Lock()
+_rate_hits: Dict[str, deque] = {}
+
+def enforce_rate_limit(request: Request, bucket: str, limit: int, window_sec: float) -> None:
+    ip = client_ip(request)
+    key = f"{bucket}:{ip}"
+    now = time.monotonic()
+    cutoff = now - window_sec
+    with _rate_lock:
+        hits = _rate_hits.get(key)
+        if hits is None:
+            hits = deque()
+            _rate_hits[key] = hits
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
+        if len(hits) >= limit:
+            raise HTTPException(429, "Terlalu banyak permintaan. Coba lagi beberapa saat lagi.")
+        hits.append(now)
+        if len(_rate_hits) > 4000:
+            stale = [k for k, dq in _rate_hits.items() if not dq or dq[-1] <= cutoff]
+            for k in stale:
+                _rate_hits.pop(k, None)
+
+def _sniff_upload_ext(data: bytes) -> Optional[str]:
+    """Canonical extension from file contents. Filename is not trusted."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"%PDF-"):
+        return ".pdf"
+    return None
+
+async def _read_upload_bounded(file: UploadFile) -> bytes:
+    """Read until EOF or one byte past the cap, then stop. The rest is not kept."""
+    buf = bytearray()
+    try:
+        while True:
+            chunk = await file.read(_UPLOAD_READ_CHUNK)
+            if not chunk:
+                break
+            if len(buf) + len(chunk) > MAX_UPLOAD_BYTES:
+                raise HTTPException(400, f"Ukuran file melebihi {MAX_UPLOAD_BYTES // (1024*1024)}MB")
+            buf.extend(chunk)
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+    if not buf:
+        raise HTTPException(400, "File kosong")
+    return bytes(buf)
+
+async def _save_checked_upload(file: UploadFile, allowed_ext: set, *, private: bool = False) -> Dict[str, Any]:
+    data = await _read_upload_bounded(file)
+    ext = _sniff_upload_ext(data)
+    if ext not in allowed_ext:
+        raise HTTPException(400, f"Format tidak didukung. Gunakan: {', '.join(sorted(allowed_ext))}")
+    fname = f"{new_id()}{ext}"
+    folder = PRIVATE_UPLOAD_DIR if private else UPLOAD_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    fpath = folder / fname
+    with open(fpath, "wb") as f:
+        f.write(data)
+    prefix = "/api/private-uploads" if private else "/api/uploads"
+    return {"url": f"{prefix}/{fname}", "filename": fname, "size": len(data)}
+
+def _upload_path_in(root: Path, pattern: re.Pattern, url: str) -> Path:
+    match = pattern.fullmatch((url or "").strip())
+    if not match:
+        raise HTTPException(400, "URL berkas tidak valid")
+    base = root.resolve()
+    path = (base / match.group(1)).resolve()
+    if path.parent != base or not path.is_file():
+        raise HTTPException(400, "Berkas tidak ditemukan")
+    return path
+
+def _local_upload_path(url: str) -> Path:
+    return _upload_path_in(UPLOAD_DIR, _UPLOAD_URL_RE, url)
+
+def _private_upload_path(url: str) -> Path:
+    return _upload_path_in(PRIVATE_UPLOAD_DIR, _PRIVATE_URL_RE, url)
+
+def _is_private_doc(label: str) -> bool:
+    return (label or "").strip().lower() in PRIVATE_DOC_LABELS
+
 # ============ Routes: File Uploads (local disk) ============
 @api.post("/uploads/photo")
 async def upload_photo(file: UploadFile = File(...), user=Depends(get_current_user)):
     if user["role"] not in ("admin", "operator"):
         raise HTTPException(403, "Hanya admin/operator yang dapat unggah foto")
-    ext = Path(file.filename or "").suffix.lower()
-    if ext not in ALLOWED_IMAGE_EXT:
-        raise HTTPException(400, f"Format tidak didukung. Gunakan: {', '.join(sorted(ALLOWED_IMAGE_EXT))}")
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(400, f"Ukuran file melebihi {MAX_UPLOAD_BYTES // (1024*1024)}MB")
-    if len(data) == 0:
-        raise HTTPException(400, "File kosong")
-    fname = f"{new_id()}{ext}"
-    fpath = UPLOAD_DIR / fname
-    with open(fpath, "wb") as f:
-        f.write(data)
-    return {"url": f"/api/uploads/{fname}", "filename": fname, "size": len(data)}
-
-# Public upload — used by self-registration form (no auth). Allows images + PDF.
-ALLOWED_DOC_EXT = ALLOWED_IMAGE_EXT | {".pdf"}
+    return await _save_checked_upload(file, ALLOWED_IMAGE_EXT)
 
 @api.post("/public/uploads/document")
-async def public_upload_document(file: UploadFile = File(...)):
-    ext = Path(file.filename or "").suffix.lower()
-    if ext not in ALLOWED_DOC_EXT:
-        raise HTTPException(400, f"Format tidak didukung. Gunakan: {', '.join(sorted(ALLOWED_DOC_EXT))}")
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(400, f"Ukuran file melebihi {MAX_UPLOAD_BYTES // (1024*1024)}MB")
-    if len(data) == 0:
-        raise HTTPException(400, "File kosong")
-    fname = f"{new_id()}{ext}"
-    fpath = UPLOAD_DIR / fname
-    with open(fpath, "wb") as f:
-        f.write(data)
-    return {"url": f"/api/uploads/{fname}", "filename": fname, "size": len(data)}
+async def public_upload_document(request: Request, file: UploadFile = File(...), label: str = Form("")):
+    enforce_rate_limit(request, "public_upload", PUBLIC_UPLOAD_LIMIT, PUBLIC_UPLOAD_WINDOW_SEC)
+    return await _save_checked_upload(file, ALLOWED_DOC_EXT, private=_is_private_doc(label))
+
+@api.get("/uploads/{filename}")
+async def serve_public_upload(filename: str):
+    """Foto atlet dan logo event. Berkas di uploads/private tidak bisa diambil dari sini."""
+    try:
+        path = _local_upload_path(f"/api/uploads/{filename}")
+    except HTTPException:
+        raise HTTPException(404, "Berkas tidak ditemukan")
+    return FileResponse(path)
 
 # ============ Atomic counters (for registration_number, participant_number) ============
 async def next_seq(key: str) -> int:
@@ -719,6 +994,11 @@ async def delete_event(eid: str, user=Depends(require_roles("admin"))):
     bracket_ids = [b["id"] for b in brackets]
     regs = await db.registrations.find({"event_id": eid}, {"id": 1}).to_list(10000)
     reg_ids = [r["id"] for r in regs]
+    class_rows = await db.classes.find({"event_id": eid}, {"id": 1}).to_list(5000)
+    category_rows = await db.categories.find({"event_id": eid}, {"id": 1}).to_list(5000)
+    quota_ids = [f"class:{row['id']}" for row in class_rows] + [f"category:{row['id']}" for row in category_rows]
+    if quota_ids:
+        await db.acceptance_quotas.delete_many({"_id": {"$in": quota_ids}})
     if match_ids:
         await db.score_logs.delete_many({"match_id": {"$in": match_ids}})
         await db.score_votes.delete_many({"match_id": {"$in": match_ids}})
@@ -740,6 +1020,217 @@ async def delete_event(eid: str, user=Depends(require_roles("admin"))):
     await db.events.delete_one({"id": eid})
     return {"ok": True}
 
+def _used_by_message(label: str, used: List[str]) -> str:
+    if len(used) == 1:
+        joined = used[0]
+    elif len(used) == 2:
+        joined = f"{used[0]} dan {used[1]}"
+    else:
+        joined = ", ".join(used[:-1]) + f", dan {used[-1]}"
+    return f"{label} masih dipakai oleh {joined}"
+
+async def _reject_if_referenced(label: str, checks: List[tuple]) -> None:
+    used: List[str] = []
+    for reason, collection, query in checks:
+        if reason in used:
+            continue
+        if await collection.find_one(query, {"_id": 1}):
+            used.append(reason)
+    if used:
+        raise HTTPException(409, _used_by_message(label, used))
+
+_REG_STATUS_LABEL = {
+    "draft": "Draf",
+    "pending_verification": "Menunggu verifikasi",
+    "need_revision": "Perlu revisi",
+    "verification_rejected": "Verifikasi ditolak",
+    "verified": "Terverifikasi",
+    "selection_process": "Seleksi",
+    "accepted": "Diterima",
+    "reserve": "Cadangan",
+    "rejected": "Ditolak",
+    "active_participant": "Peserta aktif",
+}
+_MATCH_STATUS_LABEL = {
+    "scheduled": "Terjadwal",
+    "in_progress": "Berlangsung",
+    "paused": "Dijeda",
+    "finished": "Selesai",
+    "approved": "Disahkan",
+}
+
+def _mapped_label(mapping: Dict[str, str], value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    return mapping.get(str(value), str(value))
+
+def _fill_sheet(ws, headers: List[str], rows: List[List[Any]]) -> None:
+    from openpyxl.styles import Font
+    bold = Font(bold=True)
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = bold
+    for row in rows:
+        ws.append(["" if value is None else value for value in row])
+    if headers:
+        ws.freeze_panes = "A2"
+        last_col = ws.cell(1, len(headers)).column_letter
+        ws.auto_filter.ref = f"A1:{last_col}{ws.max_row or 1}"
+
+async def _corner_scores(match_ids: List[str]) -> Dict[str, Dict[str, int]]:
+    scores: Dict[str, Dict[str, int]] = {}
+    if not match_ids:
+        return scores
+    cursor = db.score_logs.find(
+        {"match_id": {"$in": match_ids}, "valid": {"$ne": False}},
+        {"_id": 0, "match_id": 1, "corner": 1, "action_type": 1, "points": 1},
+    )
+    async for log in cursor:
+        bucket = scores.setdefault(log.get("match_id"), {"red": 0, "blue": 0})
+        kind = log.get("action_type")
+        corner = log.get("corner")
+        try:
+            pts = int(log.get("points") or 0)
+        except (TypeError, ValueError):
+            pts = 0
+        if kind in ("score", "fall") and corner in ("red", "blue"):
+            bucket[corner] += pts
+        elif kind == "penalty" and corner in ("red", "blue"):
+            bucket["blue" if corner == "red" else "red"] += pts
+    return scores
+
+def _winner_label(match: Dict[str, Any], names: Dict[str, str]) -> str:
+    corner = match.get("winner_corner")
+    if corner == "draw":
+        return "Seri"
+    if corner == "red":
+        return names.get(match.get("red_athlete_id") or "", "Merah")
+    if corner == "blue":
+        return names.get(match.get("blue_athlete_id") or "", "Biru")
+    return ""
+
+def _seni_names(match: Dict[str, Any], names: Dict[str, str]) -> str:
+    if (match.get("discipline") or "tanding") == "tanding":
+        return ""
+    ids: List[str] = []
+    if match.get("red_athlete_id"):
+        ids.append(match["red_athlete_id"])
+    for pid in match.get("performer_ids") or []:
+        if pid and pid not in ids:
+            ids.append(pid)
+    if match.get("blue_athlete_id") and match["blue_athlete_id"] not in ids:
+        ids.append(match["blue_athlete_id"])
+    return ", ".join(names.get(pid) or pid for pid in ids)
+
+@api.get("/events/{eid}/export.xlsx")
+async def export_event_xlsx(eid: str, user=Depends(require_roles("admin", "operator"))):
+    event = await db.events.find_one({"id": eid}, {"_id": 0, "name": 1, "code": 1, "slug": 1})
+    if not event:
+        raise HTTPException(404, "Event tidak ditemukan")
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        raise HTTPException(500, "Paket openpyxl belum terpasang")
+
+    regs = await db.registrations.find(
+        {"event_id": eid},
+        {"_id": 0, "access_code": 0, "history": 0},
+    ).sort("created_at", 1).to_list(10000)
+    await _hydrate_registrations(regs)
+    athletes = await db.athletes.find({"event_id": eid}, {"_id": 0}).sort("name", 1).to_list(10000)
+    matches = await db.matches.find({"event_id": eid}, {"_id": 0}).sort("match_number", 1).to_list(5000)
+    arenas = await _lookup_names(db.arenas, {m.get("arena_id") for m in matches})
+    classes = await _lookup_names(db.classes, {a.get("class_id") for a in athletes} | {m.get("class_id") for m in matches} | {r.get("class_id") for r in regs})
+    categories = await _lookup_names(db.categories, {a.get("category_id") for a in athletes} | {m.get("category_id") for m in matches} | {r.get("category_id") for r in regs})
+    contingents = await _lookup_names(db.contingents, {a.get("contingent_id") for a in athletes})
+    rules = {
+        rule["id"]: rule
+        for rule in await db.scoring_rules.find({"event_id": eid}, {"_id": 0, "id": 1, "round_duration_sec": 1}).to_list(200)
+    }
+    names = {a["id"]: a.get("name") or "" for a in athletes if a.get("id")}
+    scores = await _corner_scores([m["id"] for m in matches if m.get("id")])
+
+    reg_rows = [[
+        r.get("registration_number") or "",
+        r.get("name") or "",
+        r.get("gender") or "",
+        r.get("dob") or "",
+        r.get("weight") if r.get("weight") is not None else "",
+        r.get("phone") or "",
+        r.get("email") or "",
+        r.get("address") or "",
+        r.get("contingent_name") or "",
+        r.get("category_name") or categories.get(r.get("category_id") or "", ""),
+        r.get("class_name") or classes.get(r.get("class_id") or "", ""),
+        _mapped_label(_REG_STATUS_LABEL, r.get("status")),
+        r.get("participant_number") or "",
+        r.get("created_at") or "",
+    ] for r in regs]
+    athlete_rows = [[
+        a.get("participant_number") or "",
+        a.get("name") or "",
+        a.get("gender") or "",
+        a.get("dob") or "",
+        a.get("weight") if a.get("weight") is not None else "",
+        a.get("phone") or "",
+        contingents.get(a.get("contingent_id") or "", ""),
+        categories.get(a.get("category_id") or "", ""),
+        classes.get(a.get("class_id") or "", ""),
+        a.get("status") or "",
+        a.get("source") or "",
+    ] for a in athletes]
+    match_rows = []
+    for match in matches:
+        corner = scores.get(match.get("id"), {"red": 0, "blue": 0})
+        seni_score = match.get("seni_final_score")
+        match_rows.append([
+            match.get("match_number") if match.get("match_number") is not None else "",
+            match.get("discipline") or "tanding",
+            arenas.get(match.get("arena_id") or "", ""),
+            categories.get(match.get("category_id") or "", ""),
+            classes.get(match.get("class_id") or "", ""),
+            match.get("round_label") or "",
+            names.get(match.get("red_athlete_id") or "", ""),
+            names.get(match.get("blue_athlete_id") or "", ""),
+            _seni_names(match, names),
+            _mapped_label(_MATCH_STATUS_LABEL, match.get("status")),
+            _winner_label(match, names),
+            match.get("decision_method") or "",
+            corner["red"],
+            corner["blue"],
+            "" if seni_score is None else seni_score,
+            _match_round_duration(match, rules.get(match.get("scoring_rule_id"))),
+        ])
+
+    wb = Workbook()
+    reg_sheet = wb.active
+    reg_sheet.title = "Registrasi"
+    _fill_sheet(reg_sheet, [
+        "Nomor Registrasi", "Nama", "Gender", "Tanggal Lahir", "Berat", "Telepon", "Email", "Alamat",
+        "Kontingen", "Kategori", "Kelas", "Status", "Nomor Peserta", "Dibuat",
+    ], reg_rows)
+    athlete_sheet = wb.create_sheet("Atlet")
+    _fill_sheet(athlete_sheet, [
+        "Nomor Peserta", "Nama", "Gender", "Tanggal Lahir", "Berat", "Telepon",
+        "Kontingen", "Kategori", "Kelas", "Status", "Sumber",
+    ], athlete_rows)
+    result_sheet = wb.create_sheet("Hasil Partai")
+    _fill_sheet(result_sheet, [
+        "Nomor Partai", "Disiplin", "Gelanggang", "Kategori", "Kelas", "Babak",
+        "Sudut Merah", "Sudut Biru", "Pesilat Seni", "Status", "Pemenang", "Metode",
+        "Skor Merah", "Skor Biru", "Nilai Seni", "Durasi Ronde (detik)",
+    ], match_rows)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(event.get("code") or event.get("slug") or "event")).strip("-") or "event"
+    filename = f"{safe}-export.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 # ============ Routes: Categories ============
 @api.post("/categories")
 async def create_category(data: CategoryIn, user=Depends(require_roles("admin"))):
@@ -756,6 +1247,11 @@ async def list_categories(event_id: Optional[str] = None, user=Depends(get_curre
 
 @api.delete("/categories/{cid}")
 async def delete_category(cid: str, user=Depends(require_roles("admin"))):
+    await _reject_if_referenced("Kategori", [
+        ("partai", db.matches, {"category_id": cid}),
+        ("registrasi", db.registrations, {"category_id": cid}),
+        ("atlet", db.athletes, {"category_id": cid}),
+    ])
     await db.categories.delete_one({"id": cid})
     return {"ok": True}
 
@@ -780,6 +1276,11 @@ async def list_classes(event_id: Optional[str] = None, user=Depends(get_current_
 
 @api.delete("/classes/{cid}")
 async def delete_class(cid: str, user=Depends(require_roles("admin"))):
+    await _reject_if_referenced("Kelas", [
+        ("partai", db.matches, {"class_id": cid}),
+        ("registrasi", db.registrations, {"class_id": cid}),
+        ("atlet", db.athletes, {"class_id": cid}),
+    ])
     await db.classes.delete_one({"id": cid})
     return {"ok": True}
 
@@ -804,6 +1305,10 @@ async def list_contingents(event_id: Optional[str] = None, user=Depends(get_curr
 
 @api.delete("/contingents/{cid}")
 async def delete_contingent(cid: str, user=Depends(require_roles("admin"))):
+    await _reject_if_referenced("Kontingen", [
+        ("registrasi", db.registrations, {"contingent_id": cid}),
+        ("atlet", db.athletes, {"contingent_id": cid}),
+    ])
     await db.contingents.delete_one({"id": cid})
     return {"ok": True}
 
@@ -834,6 +1339,14 @@ async def list_athletes(event_id: Optional[str] = None, user=Depends(get_current
 
 @api.delete("/athletes/{aid}")
 async def delete_athlete(aid: str, user=Depends(require_roles("admin"))):
+    await _reject_if_referenced("Atlet", [
+        ("partai", db.matches, {"$or": [
+            {"red_athlete_id": aid},
+            {"blue_athlete_id": aid},
+            {"performer_ids": aid},
+        ]}),
+        ("registrasi", db.registrations, {"athlete_id": aid}),
+    ])
     await db.athletes.delete_one({"id": aid})
     return {"ok": True}
 
@@ -848,14 +1361,74 @@ async def update_athlete(aid: str, data: AthleteIn, user=Depends(require_roles("
     return await db.athletes.find_one({"id": aid}, {"_id": 0})
 
 # ============ Routes: Registrations (Phase 2) ============
+async def _lookup_names(collection, ids: set) -> Dict[str, str]:
+    clean = [i for i in ids if i]
+    if not clean:
+        return {}
+    docs = await collection.find({"id": {"$in": clean}}, {"_id": 0, "id": 1, "name": 1}).to_list(len(clean))
+    return {d["id"]: d.get("name") or "" for d in docs}
+
+async def _hydrate_registrations(regs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach files plus display names for contingent, category, and class."""
+    if not regs:
+        return regs
+    ids = [r["id"] for r in regs if r.get("id")]
+    files = await db.registration_files.find({"registration_id": {"$in": ids}}, {"_id": 0}).to_list(max(len(ids) * 10, 1))
+    files_by_reg: Dict[str, list] = {}
+    for f in files:
+        files_by_reg.setdefault(f.get("registration_id"), []).append(f)
+    contingents = await _lookup_names(db.contingents, {r.get("contingent_id") for r in regs})
+    categories = await _lookup_names(db.categories, {r.get("category_id") for r in regs})
+    classes = await _lookup_names(db.classes, {r.get("class_id") for r in regs})
+    for r in regs:
+        r["files"] = files_by_reg.get(r.get("id"), [])
+        if r.get("contingent_id") and not (r.get("contingent_name") or "").strip():
+            r["contingent_name"] = contingents.get(r["contingent_id"], "")
+        r["category_name"] = categories.get(r.get("category_id") or "", "")
+        r["class_name"] = classes.get(r.get("class_id") or "", "")
+    return regs
+
 async def _hydrate_registration(reg: Dict[str, Any]) -> Dict[str, Any]:
-    files = await db.registration_files.find({"registration_id": reg["id"]}, {"_id": 0}).to_list(50)
-    reg["files"] = files
+    await _hydrate_registrations([reg])
     return reg
 
+_PUBLIC_LOOKUP_DENIED = "Nomor atau kode akses tidak sesuai"
+
+def _access_codes_match(stored: str, provided: str) -> bool:
+    left = stored or ""
+    right = provided or ""
+    if not left or not right or len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
+
+async def _ensure_access_code(reg: Dict[str, Any]) -> Dict[str, Any]:
+    """Create an access code for registrations saved before codes existed."""
+    if (reg.get("access_code") or "").strip():
+        return reg
+    code = secrets.token_urlsafe(6)
+    updated = await db.registrations.find_one_and_update(
+        {
+            "id": reg["id"],
+            "$or": [
+                {"access_code": {"$exists": False}},
+                {"access_code": None},
+                {"access_code": ""},
+            ],
+        },
+        {"$set": {"access_code": code}},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated:
+        return updated
+    fresh = await db.registrations.find_one({"id": reg["id"]}, {"_id": 0})
+    return fresh or reg
+
 @api.post("/public/registrations")
-async def public_create_registration(data: RegistrationIn):
+async def public_create_registration(data: RegistrationIn, request: Request):
+    enforce_rate_limit(request, "public_registration", PUBLIC_REGISTRATION_LIMIT, PUBLIC_REGISTRATION_WINDOW_SEC)
     # Validate event exists and is active for registration
+    _normalize_registration_ids(data)
     ev = await db.events.find_one({"id": data.event_id}, {"_id": 0})
     if not ev:
         raise HTTPException(404, "Event tidak ditemukan")
@@ -865,12 +1438,14 @@ async def public_create_registration(data: RegistrationIn):
             raise HTTPException(400, "Pendaftaran event ini sudah ditutup")
     if ev.get("registration_enabled") is False:
         raise HTTPException(400, "Pendaftaran event ini belum dibuka")
+    await _validate_registration_placement(data)
     seq = await next_seq(f"registration:{data.event_id}")
     reg_number = fmt_number("REG", ev.get("code") or ev.get("name") or "EVENT", seq)
     doc = data.model_dump()
     doc.update({
         "id": new_id(),
         "registration_number": reg_number,
+        "access_code": secrets.token_urlsafe(6),
         "status": "pending_verification",
         "admin_notes": "",
         "history": [{"status": "pending_verification", "at": now_iso(), "by": "public"}],
@@ -883,28 +1458,76 @@ async def public_create_registration(data: RegistrationIn):
 
 @api.post("/public/registrations/{rid}/files")
 async def public_attach_file(rid: str, data: RegistrationFileIn):
-    reg = await db.registrations.find_one({"id": rid})
+    reg = await db.registrations.find_one({"id": rid}, {"_id": 0, "id": 1, "access_code": 1})
     if not reg:
         raise HTTPException(404, "Registrasi tidak ditemukan")
-    rec = {"id": new_id(), "registration_id": rid, "label": data.label, "url": data.url, "uploaded_at": now_iso()}
+    if not _access_codes_match(reg.get("access_code") or "", (data.access_code or "").strip()):
+        raise HTTPException(403, "Kode akses tidak valid")
+    label = (data.label or "").strip()
+    if _is_private_doc(label):
+        path = _private_upload_path(data.url)
+        stored_url = f"/api/private-uploads/{path.name}"
+    else:
+        path = _local_upload_path(data.url)
+        stored_url = f"/api/uploads/{path.name}"
+    count = await db.registration_files.count_documents({"registration_id": rid})
+    if count >= MAX_REGISTRATION_FILES:
+        raise HTTPException(400, f"Jumlah berkas melebihi batas ({MAX_REGISTRATION_FILES})")
+    rec = {
+        "id": new_id(),
+        "registration_id": rid,
+        "label": label or data.label,
+        "url": stored_url,
+        "uploaded_at": now_iso(),
+    }
     await db.registration_files.insert_one(rec)
     rec.pop("_id", None)
     return rec
 
-@api.get("/public/registrations/{rid}")
-async def public_get_registration(rid: str):
-    """Public status check by registration ID."""
-    reg = await db.registrations.find_one({"id": rid}, {"_id": 0, "admin_notes": 0})
-    if not reg:
-        raise HTTPException(404, "Registrasi tidak ditemukan")
-    return await _hydrate_registration(reg)
+def _registration_file_path(rec: Dict[str, Any]) -> Path:
+    url = (rec.get("url") or "").strip()
+    if _PRIVATE_URL_RE.fullmatch(url):
+        return _private_upload_path(url)
+    return _local_upload_path(url)
 
-@api.get("/public/registrations/by-number/{number}")
-async def public_get_registration_by_number(number: str):
-    reg = await db.registrations.find_one({"registration_number": number}, {"_id": 0, "admin_notes": 0})
-    if not reg:
-        raise HTTPException(404, "Registrasi tidak ditemukan")
-    return await _hydrate_registration(reg)
+@api.get("/public/registrations/{rid}/files/{fid}")
+async def public_download_registration_file(rid: str, fid: str, request: Request, access_code: str = ""):
+    """Stream a registration file only when the access code matches. Same denial as lookup."""
+    enforce_rate_limit(request, "public_file", PUBLIC_LOOKUP_LIMIT, PUBLIC_LOOKUP_WINDOW_SEC)
+    reg = await db.registrations.find_one({"id": rid}, {"_id": 0, "access_code": 1})
+    stored = ((reg or {}).get("access_code") or "").strip()
+    if not reg or not _access_codes_match(stored, (access_code or "").strip()):
+        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
+    rec = await db.registration_files.find_one({"id": fid, "registration_id": rid}, {"_id": 0})
+    if not rec:
+        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
+    try:
+        path = _registration_file_path(rec)
+    except HTTPException:
+        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
+    return FileResponse(path)
+
+@api.post("/public/registrations/lookup")
+async def public_lookup_registration(data: RegistrationLookupIn, request: Request):
+    """Status check for the participant who has both the number and the access code.
+
+    A wrong number and a wrong code return the same message so numbers cannot be enumerated.
+    """
+    enforce_rate_limit(request, "public_lookup", PUBLIC_LOOKUP_LIMIT, PUBLIC_LOOKUP_WINDOW_SEC)
+    number = (data.registration_number or "").strip()
+    code = (data.access_code or "").strip()
+    reg = None
+    if number:
+        reg = await db.registrations.find_one({"registration_number": number}, {"_id": 0})
+    stored = ((reg or {}).get("access_code") or "").strip()
+    if not reg or not _access_codes_match(stored, code):
+        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
+    reg.pop("access_code", None)
+    reg.pop("admin_notes", None)
+    hydrated = await _hydrate_registration(reg)
+    hydrated.pop("access_code", None)
+    hydrated.pop("admin_notes", None)
+    return hydrated
 
 @api.get("/registrations")
 async def list_registrations(
@@ -919,26 +1542,68 @@ async def list_registrations(
         if statuses:
             q["status"] = {"$in": statuses}
     regs = await db.registrations.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
-    for r in regs:
-        await _hydrate_registration(r)
-    return regs
+    return await _hydrate_registrations(regs)
 
 @api.get("/registrations/{rid}")
 async def get_registration(rid: str, user=Depends(require_roles("admin", "operator"))):
     reg = await db.registrations.find_one({"id": rid}, {"_id": 0})
     if not reg:
         raise HTTPException(404, "Registrasi tidak ditemukan")
+    reg = await _ensure_access_code(reg)
     return await _hydrate_registration(reg)
 
 @api.put("/registrations/{rid}")
 async def update_registration(rid: str, data: RegistrationIn, user=Depends(require_roles("admin", "operator"))):
-    await db.registrations.update_one({"id": rid}, {"$set": {**data.model_dump(), "updated_at": now_iso()}})
+    existing = await db.registrations.find_one({"id": rid})
+    if not existing:
+        raise HTTPException(404, "Registrasi tidak ditemukan")
+    _normalize_registration_ids(data)
+    await _validate_registration_placement(data)
+    payload = data.model_dump()
+    merged = {**existing, **payload}
+    if _occupies_acceptance_slot(existing.get("status")):
+        await _retarget_acceptance_slots(existing, merged)
+        result = await db.registrations.update_one(
+            {"id": rid, "status": existing.get("status")},
+            {"$set": {**payload, "updated_at": now_iso()}},
+        )
+        if result.matched_count == 0:
+            await _retarget_acceptance_slots(merged, existing)
+            raise HTTPException(409, "Status registrasi berubah, silakan ulangi")
+    else:
+        result = await db.registrations.update_one({"id": rid}, {"$set": {**payload, "updated_at": now_iso()}})
+        if result.matched_count == 0:
+            raise HTTPException(404, "Registrasi tidak ditemukan")
     reg = await db.registrations.find_one({"id": rid}, {"_id": 0})
     return await _hydrate_registration(reg)
 
 @api.delete("/registrations/{rid}")
 async def delete_registration(rid: str, user=Depends(require_roles("admin"))):
-    await db.registrations.delete_one({"id": rid})
+    reg = await db.registrations.find_one({"id": rid})
+    if reg and _occupies_acceptance_slot(reg.get("status")):
+        targets = _quota_targets(reg)
+        for scope, scope_id in targets:
+            await _ensure_quota_counter(scope, scope_id)
+        removed = await db.registrations.delete_one({"id": rid, "status": {"$in": list(OCCUPIED_REGISTRATION_STATUSES)}})
+        if removed.deleted_count:
+            for scope, scope_id in targets:
+                await _release_quota_slot(scope, scope_id, seed=False)
+        else:
+            await db.registrations.delete_one({"id": rid})
+    else:
+        removed = await db.registrations.delete_one({"id": rid, "status": {"$nin": list(OCCUPIED_REGISTRATION_STATUSES)}})
+        if removed.deleted_count == 0:
+            fresh = await db.registrations.find_one({"id": rid})
+            if fresh and _occupies_acceptance_slot(fresh.get("status")):
+                targets = _quota_targets(fresh)
+                for scope, scope_id in targets:
+                    await _ensure_quota_counter(scope, scope_id)
+                gone = await db.registrations.delete_one({"id": rid, "status": {"$in": list(OCCUPIED_REGISTRATION_STATUSES)}})
+                if gone.deleted_count:
+                    for scope, scope_id in targets:
+                        await _release_quota_slot(scope, scope_id, seed=False)
+            elif fresh:
+                await db.registrations.delete_one({"id": rid})
     await db.registration_files.delete_many({"registration_id": rid})
     return {"ok": True}
 
@@ -947,41 +1612,198 @@ async def delete_registration_file(rid: str, fid: str, user=Depends(require_role
     await db.registration_files.delete_one({"id": fid, "registration_id": rid})
     return {"ok": True}
 
-async def _assert_acceptance_quota(reg: Dict[str, Any], rid: str) -> None:
-    """Reject when the class or category quota for accepted participants is already full."""
-    occupied = {"event_id": reg["event_id"], "status": {"$in": ["accepted", "active_participant"]}, "id": {"$ne": rid}}
-    if reg.get("class_id"):
-        cls = await db.classes.find_one({"id": reg["class_id"]}, {"quota": 1})
-        quota = int((cls or {}).get("quota") or 0)
-        if quota > 0:
-            count = await db.registrations.count_documents({**occupied, "class_id": reg["class_id"]})
-            if count >= quota:
-                raise HTTPException(400, f"Kuota kelas penuh ({count}/{quota}). Jadikan cadangan atau tolak.")
-    if reg.get("category_id"):
-        cat = await db.categories.find_one({"id": reg["category_id"]}, {"quota": 1})
-        quota = int((cat or {}).get("quota") or 0)
-        if quota > 0:
-            count = await db.registrations.count_documents({**occupied, "category_id": reg["category_id"]})
-            if count >= quota:
-                raise HTTPException(400, f"Kuota kategori penuh ({count}/{quota}). Jadikan cadangan atau tolak.")
+def _clean_id(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_registration_ids(data: RegistrationIn) -> None:
+    data.category_id = _clean_id(data.category_id)
+    data.class_id = _clean_id(data.class_id)
+    data.contingent_id = _clean_id(data.contingent_id)
+
+
+def _occupies_acceptance_slot(status: Optional[str]) -> bool:
+    return status in OCCUPIED_REGISTRATION_STATUSES
+
+
+def _quota_doc_id(scope: str, scope_id: str) -> str:
+    return f"{scope}:{scope_id}"
+
+
+def _quota_targets(reg: Dict[str, Any]) -> List[tuple]:
+    targets = []
+    class_id = _clean_id(reg.get("class_id"))
+    category_id = _clean_id(reg.get("category_id"))
+    if class_id:
+        targets.append(("class", class_id))
+    if category_id:
+        targets.append(("category", category_id))
+    return targets
+
+
+async def _validate_registration_placement(data: RegistrationIn) -> None:
+    """Category and class must belong to the event, and the class must sit in that category.
+
+    Category gender is enforced too. `campuran` accepts both putra and putri.
+    """
+    category_id = _clean_id(data.category_id)
+    class_id = _clean_id(data.class_id)
+    if category_id:
+        category = await db.categories.find_one({"id": category_id}, {"_id": 0, "event_id": 1, "gender": 1})
+        if not category or category.get("event_id") != data.event_id:
+            raise HTTPException(400, "Kategori bukan milik event ini")
+        category_gender = category.get("gender") or "putra"
+        if category_gender != "campuran" and data.gender != category_gender:
+            raise HTTPException(400, "Gender peserta tidak sesuai dengan kategori")
+    if class_id:
+        kelas = await db.classes.find_one({"id": class_id}, {"_id": 0, "event_id": 1, "category_id": 1})
+        if not kelas or kelas.get("event_id") != data.event_id:
+            raise HTTPException(400, "Kelas bukan milik event ini")
+        if not category_id or kelas.get("category_id") != category_id:
+            raise HTTPException(400, "Kelas bukan bagian dari kategori yang dipilih")
+
+
+async def _lookup_quota(scope: str, scope_id: str) -> int:
+    coll = db.classes if scope == "class" else db.categories
+    doc = await coll.find_one({"id": scope_id}, {"quota": 1})
+    try:
+        return int((doc or {}).get("quota") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _ensure_quota_counter(scope: str, scope_id: str) -> None:
+    """Create the counter from registrations already occupying a slot, once."""
+    key = _quota_doc_id(scope, scope_id)
+    existing = await db.acceptance_quotas.find_one({"_id": key}, {"_id": 1})
+    if existing:
+        return
+    field = "class_id" if scope == "class" else "category_id"
+    used = await db.registrations.count_documents({
+        field: scope_id,
+        "status": {"$in": list(OCCUPIED_REGISTRATION_STATUSES)},
+    })
+    try:
+        await db.acceptance_quotas.insert_one({
+            "_id": key,
+            "scope": scope,
+            "scope_id": scope_id,
+            "used": int(used),
+            "quota": 0,
+        })
+    except DuplicateKeyError:
+        return
+
+
+async def _acquire_quota_slot(scope: str, scope_id: str) -> None:
+    """Increment one class or category counter. Limited quotas only move while used < quota."""
+    quota = await _lookup_quota(scope, scope_id)
+    key = _quota_doc_id(scope, scope_id)
+    await _ensure_quota_counter(scope, scope_id)
+    label = "kelas" if scope == "class" else "kategori"
+    fields = {"quota": quota, "scope": scope, "scope_id": scope_id}
+    if quota <= 0:
+        await db.acceptance_quotas.update_one({"_id": key}, {"$inc": {"used": 1}, "$set": fields})
+        return
+    updated = await db.acceptance_quotas.find_one_and_update(
+        {"_id": key, "used": {"$lt": quota}},
+        {"$inc": {"used": 1}, "$set": fields},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated:
+        return
+    current = await db.acceptance_quotas.find_one({"_id": key}, {"used": 1})
+    used = int((current or {}).get("used") or quota)
+    raise HTTPException(400, f"Kuota {label} penuh ({used}/{quota}). Jadikan cadangan atau tolak.")
+
+
+async def _release_quota_slot(scope: str, scope_id: str, *, seed: bool = True) -> None:
+    key = _quota_doc_id(scope, scope_id)
+    if seed:
+        await _ensure_quota_counter(scope, scope_id)
+    await db.acceptance_quotas.update_one({"_id": key, "used": {"$gt": 0}}, {"$inc": {"used": -1}})
+
+
+async def _acquire_acceptance_slots(reg: Dict[str, Any]) -> None:
+    acquired: List[tuple] = []
+    try:
+        for scope, scope_id in _quota_targets(reg):
+            await _acquire_quota_slot(scope, scope_id)
+            acquired.append((scope, scope_id))
+    except HTTPException:
+        for scope, scope_id in reversed(acquired):
+            await _release_quota_slot(scope, scope_id, seed=False)
+        raise
+
+
+async def _release_acceptance_slots(reg: Dict[str, Any], *, seed: bool = True) -> None:
+    for scope, scope_id in _quota_targets(reg):
+        await _release_quota_slot(scope, scope_id, seed=seed)
+
+
+async def _retarget_acceptance_slots(old_reg: Dict[str, Any], new_reg: Dict[str, Any]) -> None:
+    """Move an occupied slot when class or category changes. Same ids are left untouched."""
+    old_targets = _quota_targets(old_reg)
+    new_targets = _quota_targets(new_reg)
+    old_set = set(old_targets)
+    new_set = set(new_targets)
+    acquired: List[tuple] = []
+    try:
+        for scope, scope_id in new_targets:
+            if (scope, scope_id) in old_set:
+                continue
+            await _acquire_quota_slot(scope, scope_id)
+            acquired.append((scope, scope_id))
+    except HTTPException:
+        for scope, scope_id in reversed(acquired):
+            await _release_quota_slot(scope, scope_id, seed=False)
+        raise
+    for scope, scope_id in old_targets:
+        if (scope, scope_id) not in new_set:
+            await _release_quota_slot(scope, scope_id, seed=True)
+
 
 @api.post("/registrations/{rid}/status")
 async def update_registration_status(rid: str, data: RegistrationUpdateStatusIn, user=Depends(require_roles("admin", "operator"))):
     reg = await db.registrations.find_one({"id": rid})
     if not reg:
         raise HTTPException(404, "Registrasi tidak ditemukan")
-    if data.status == "accepted":
-        await _assert_acceptance_quota(reg, rid)
-    history_entry = {"status": data.status, "at": now_iso(), "by": user["id"], "notes": data.admin_notes}
+    old_status = reg.get("status")
+    new_status = data.status
+    entering = _occupies_acceptance_slot(new_status) and not _occupies_acceptance_slot(old_status)
+    leaving = _occupies_acceptance_slot(old_status) and not _occupies_acceptance_slot(new_status)
+    if entering:
+        await _acquire_acceptance_slots(reg)
+    elif leaving:
+        for scope, scope_id in _quota_targets(reg):
+            await _ensure_quota_counter(scope, scope_id)
+    history_entry = {"status": new_status, "at": now_iso(), "by": user["id"], "notes": data.admin_notes}
     update = {
-        "$set": {"status": data.status, "admin_notes": data.admin_notes, "updated_at": now_iso()},
+        "$set": {"status": new_status, "admin_notes": data.admin_notes, "updated_at": now_iso()},
         "$push": {"history": history_entry},
     }
-    await db.registrations.update_one({"id": rid}, update)
+    try:
+        result = await db.registrations.update_one({"id": rid, "status": old_status}, update)
+    except Exception:
+        if entering:
+            await _release_acceptance_slots(reg, seed=False)
+        raise
+    if result.matched_count == 0:
+        if entering:
+            await _release_acceptance_slots(reg, seed=False)
+        fresh = await db.registrations.find_one({"id": rid}, {"_id": 0})
+        if not fresh:
+            raise HTTPException(404, "Registrasi tidak ditemukan")
+        raise HTTPException(409, "Status registrasi berubah, silakan ulangi")
+    if leaving:
+        await _release_acceptance_slots(reg, seed=False)
     fresh = await db.registrations.find_one({"id": rid}, {"_id": 0})
     # Best-effort WhatsApp notification (skipped if WAHA disabled or no template)
     try:
-        await _dispatch_registration_notification(fresh, data.status)
+        await _dispatch_registration_notification(fresh, new_status)
     except Exception as e:
         print(f"[waha] notification dispatch failed for reg {rid}: {e}")
     return await _hydrate_registration(fresh)
@@ -990,61 +1812,76 @@ async def update_registration_status(rid: str, data: RegistrationUpdateStatusIn,
 async def convert_to_athlete(rid: str, user=Depends(require_roles("admin", "operator"))):
     """Convert an accepted/reserve registration into an active participant in `athletes` collection.
     The registration must already be in 'accepted' status (or admin override).
+
+    Moving accepted → active_participant keeps the same quota slot. A reserve
+    promotion takes a slot only if one is still free.
     """
     reg = await db.registrations.find_one({"id": rid})
     if not reg:
         raise HTTPException(404, "Registrasi tidak ditemukan")
     if reg.get("status") not in ("accepted", "reserve"):
         raise HTTPException(400, "Hanya registrasi dengan status diterima yang dapat dijadikan peserta aktif")
+    acquired = False
+    athlete_id = None
     if reg.get("status") == "reserve":
-        await _assert_acceptance_quota(reg, rid)
-    # Resolve or create contingent if only name given
-    contingent_id = reg.get("contingent_id")
-    if not contingent_id and reg.get("contingent_name"):
-        existing = await db.contingents.find_one({"event_id": reg["event_id"], "name": reg["contingent_name"]})
-        if existing:
-            contingent_id = existing["id"]
-        else:
-            new_cont = {
-                "id": new_id(),
-                "event_id": reg["event_id"],
-                "name": reg["contingent_name"],
-                "region": "",
-                "created_at": now_iso(),
-            }
-            await db.contingents.insert_one(new_cont)
-            contingent_id = new_cont["id"]
-    if not contingent_id:
-        raise HTTPException(400, "Kontingen registrasi tidak valid")
-    ev = await db.events.find_one({"id": reg["event_id"]}, {"code": 1, "name": 1})
-    code = (ev or {}).get("code") or (ev or {}).get("name") or "EVENT"
-    seq = await next_seq(f"participant:{reg['event_id']}")
-    pnum = fmt_number("PST", code, seq)
-    athlete = {
-        "id": new_id(),
-        "event_id": reg["event_id"],
-        "contingent_id": contingent_id,
-        "class_id": reg.get("class_id"),
-        "category_id": reg.get("category_id"),
-        "name": reg["name"],
-        "gender": reg.get("gender", "putra"),
-        "dob": reg.get("dob"),
-        "weight": float(reg.get("weight") or 0),
-        "photo_url": reg.get("photo_url", ""),
-        "phone": reg.get("phone", ""),
-        "source": "self_registration",
-        "registration_id": rid,
-        "participant_number": pnum,
-        "status": "active",
-        "created_at": now_iso(),
-    }
-    await db.athletes.insert_one(athlete)
-    # Mark registration as active_participant + record participant_number link
-    history_entry = {"status": "active_participant", "at": now_iso(), "by": user["id"], "notes": f"Dikonversi ke peserta aktif {pnum}"}
-    await db.registrations.update_one({"id": rid}, {
-        "$set": {"status": "active_participant", "athlete_id": athlete["id"], "participant_number": pnum, "updated_at": now_iso()},
-        "$push": {"history": history_entry},
-    })
+        await _acquire_acceptance_slots(reg)
+        acquired = True
+    try:
+        # Resolve or create contingent if only name given
+        contingent_id = reg.get("contingent_id")
+        if not contingent_id and reg.get("contingent_name"):
+            existing = await db.contingents.find_one({"event_id": reg["event_id"], "name": reg["contingent_name"]})
+            if existing:
+                contingent_id = existing["id"]
+            else:
+                new_cont = {
+                    "id": new_id(),
+                    "event_id": reg["event_id"],
+                    "name": reg["contingent_name"],
+                    "region": "",
+                    "created_at": now_iso(),
+                }
+                await db.contingents.insert_one(new_cont)
+                contingent_id = new_cont["id"]
+        if not contingent_id:
+            raise HTTPException(400, "Kontingen registrasi tidak valid")
+        ev = await db.events.find_one({"id": reg["event_id"]}, {"code": 1, "name": 1})
+        code = (ev or {}).get("code") or (ev or {}).get("name") or "EVENT"
+        seq = await next_seq(f"participant:{reg['event_id']}")
+        pnum = fmt_number("PST", code, seq)
+        athlete = {
+            "id": new_id(),
+            "event_id": reg["event_id"],
+            "contingent_id": contingent_id,
+            "class_id": reg.get("class_id"),
+            "category_id": reg.get("category_id"),
+            "name": reg["name"],
+            "gender": reg.get("gender", "putra"),
+            "dob": reg.get("dob"),
+            "weight": float(reg.get("weight") or 0),
+            "photo_url": reg.get("photo_url", ""),
+            "phone": reg.get("phone", ""),
+            "source": "self_registration",
+            "registration_id": rid,
+            "participant_number": pnum,
+            "status": "active",
+            "created_at": now_iso(),
+        }
+        await db.athletes.insert_one(athlete)
+        athlete_id = athlete["id"]
+        history_entry = {"status": "active_participant", "at": now_iso(), "by": user["id"], "notes": f"Dikonversi ke peserta aktif {pnum}"}
+        result = await db.registrations.update_one({"id": rid, "status": reg.get("status")}, {
+            "$set": {"status": "active_participant", "athlete_id": athlete["id"], "participant_number": pnum, "updated_at": now_iso()},
+            "$push": {"history": history_entry},
+        })
+        if result.matched_count == 0:
+            raise HTTPException(409, "Status registrasi berubah, silakan ulangi")
+    except Exception:
+        if athlete_id:
+            await db.athletes.delete_one({"id": athlete_id})
+        if acquired:
+            await _release_acceptance_slots(reg, seed=False)
+        raise
     athlete.pop("_id", None)
     # Best-effort WhatsApp notification when becoming active participant
     try:
@@ -1132,6 +1969,7 @@ async def _dispatch_registration_notification(reg: Dict[str, Any], reg_status: s
         "registration_number": reg.get("registration_number", ""),
         "participant_number": reg.get("participant_number", ""),
         "admin_notes": reg.get("admin_notes", ""),
+        "access_code": reg.get("access_code", ""),
     }
     if extra_ctx:
         ctx.update(extra_ctx)
@@ -1219,10 +2057,19 @@ async def public_list_arenas(event_id: Optional[str] = None):
     q = {"event_id": event_id} if event_id else {}
     return await list_collection(db.arenas, q)
 
+_PUBLIC_ATHLETE_KEYS = ("id", "name", "photo_url", "gender", "weight", "contingent_id")
+_PUBLIC_ATHLETE_PROJECTION = {"_id": 0, **{key: 1 for key in _PUBLIC_ATHLETE_KEYS}}
+
+def _redact_public_athlete(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not doc:
+        return None
+    return {key: doc.get(key) for key in _PUBLIC_ATHLETE_KEYS}
+
 @api.get("/public/athletes")
 async def public_list_athletes(event_id: Optional[str] = None):
     q = {"event_id": event_id} if event_id else {}
-    return await list_collection(db.athletes, q)
+    docs = await db.athletes.find(q, _PUBLIC_ATHLETE_PROJECTION).to_list(2000)
+    return [_redact_public_athlete(doc) for doc in docs]
 
 @api.get("/public/events")
 async def public_list_events():
@@ -1305,7 +2152,7 @@ async def create_match(data: MatchIn, user=Depends(require_roles("admin", "opera
         "created_at": now_iso(),
         "status": "scheduled",
         "current_round": 1,
-        "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1},
+        "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1, "phase": "round"},
         "winner_corner": None,
         "decision_method": None,
         "approved_by": None,
@@ -1313,10 +2160,10 @@ async def create_match(data: MatchIn, user=Depends(require_roles("admin", "opera
         "started_at": None,
         "finished_at": None,
     })
-    # initial remaining sec from rule
     rule = await db.scoring_rules.find_one({"id": data.scoring_rule_id})
-    if rule:
-        doc["timer"]["remaining_sec"] = rule.get("round_duration_sec", 120)
+    if doc.get("round_duration_sec") is None:
+        doc.pop("round_duration_sec", None)
+    doc["timer"]["remaining_sec"] = _match_round_duration(doc, rule)
     await db.matches.insert_one(doc)
     doc.pop("_id", None)
     await broadcast_match_update(doc["id"], "created")
@@ -1345,7 +2192,7 @@ async def public_get_match(mid: str):
     state = await compute_match_state(mid)
     if not state:
         raise HTTPException(404, "Match tidak ditemukan")
-    return state
+    return redact_public_match(state)
 
 @api.get("/public/arenas/{arena_id}/current")
 async def public_arena_current(arena_id: str):
@@ -1358,13 +2205,20 @@ async def public_arena_current(arena_id: str):
         return {"match": None}
     await _load_match_settled(m["id"])
     state = await compute_match_state(m["id"])
-    return {"match": state}
+    return {"match": redact_public_match(state) if state else None}
 
 @api.delete("/matches/{mid}")
 async def delete_match(mid: str, user=Depends(require_roles("admin", "operator"))):
+    match = await db.matches.find_one({"id": mid}, {"bracket_id": 1})
+    if match and match.get("bracket_id"):
+        bracket = await db.brackets.find_one({"id": match["bracket_id"]}, {"status": 1})
+        if bracket and bracket.get("status") == "running":
+            raise HTTPException(400, "Partai pada bracket yang sedang berjalan tidak dapat dihapus")
     await db.matches.delete_one({"id": mid})
     await db.score_logs.delete_many({"match_id": mid})
     await db.score_votes.delete_many({"match_id": mid})
+    await db.seni_scores.delete_many({"match_id": mid})
+    await db.seni_penalties.delete_many({"match_id": mid})
     return {"ok": True}
 
 def _action_points(data: ScoreActionIn, rule: Dict[str, Any]) -> int:
@@ -1376,12 +2230,12 @@ def _action_points(data: ScoreActionIn, rule: Dict[str, Any]) -> int:
             points = int(rule.get("penalty_points", {}).get(data.code, 0))
     return points
 
-async def _apply_jury_consensus(mid: str, match: Dict[str, Any], data: ScoreActionIn, user: Dict[str, Any], role: str, points: int) -> Dict[str, Any]:
+async def _apply_jury_consensus(mid: str, match: Dict[str, Any], data: ScoreActionIn, user: Dict[str, Any], role: str, points: int, rule: Dict[str, Any]) -> Dict[str, Any]:
     """A score counts once when two different juries press the same action within the window."""
     lock = _consensus_lock(mid)
     async with lock:
         now = datetime.now(timezone.utc)
-        window_start = (now - timedelta(seconds=JURY_CONSENSUS_WINDOW_SEC)).isoformat()
+        window_start = (now - timedelta(seconds=_consensus_window_sec(rule))).isoformat()
         key = {
             "match_id": mid,
             "round": match.get("current_round", 1),
@@ -1467,6 +2321,7 @@ async def _apply_jury_consensus(mid: str, match: Dict[str, Any], data: ScoreActi
         }
         await db.score_logs.insert_one(log)
         await db.score_votes.update_many({"id": {"$in": [v["id"] for v in unlinked]}}, {"$set": {"log_id": log["id"]}})
+        await _maybe_technical_win(match, rule, log["id"])
         await broadcast_match_update(mid, "score_update")
         log.pop("_id", None)
         log["confirmed"] = True
@@ -1485,12 +2340,16 @@ async def add_action(mid: str, data: ScoreActionIn, user=Depends(require_roles("
         raise HTTPException(400, "Match tidak sedang berjalan")
 
     role = user["role"]
+    if data.action_type == "fall":
+        raise HTTPException(400, "Jatuhan masuk lewat juri.")
     if data.action_type == "score" and role not in ("jury", "admin"):
         raise HTTPException(403, "Hanya juri yang dapat memberi skor")
-    if data.action_type in ("penalty", "fall", "binaan", "absolute_win") and role not in ("referee", "head_jury", "admin"):
+    if data.action_type in ("penalty", "binaan", "absolute_win") and role not in ("referee", "head_jury", "admin"):
         raise HTTPException(403, "Hanya wasit/ketua juri yang dapat memberi tindakan ini")
 
     timer = match.get("timer") or {}
+    if data.action_type == "score" and timer.get("phase") == "rest":
+        raise HTTPException(400, "Sedang istirahat. Mulai ronde berikutnya sebelum menambah skor.")
     clock_done = not timer.get("running") and float(timer.get("remaining_sec") or 0) <= 0
     if data.action_type == "score" and clock_done:
         raise HTTPException(400, "Waktu ronde habis. Mulai ronde lagi atau akhiri partai sebelum menambah skor.")
@@ -1508,7 +2367,7 @@ async def add_action(mid: str, data: ScoreActionIn, user=Depends(require_roles("
                 raise HTTPException(400, f"Batas binaan sudut ini sudah tercapai ({limit}). Gunakan teguran.")
 
     if data.action_type == "score":
-        return await _apply_jury_consensus(mid, match, data, user, role, points)
+        return await _apply_jury_consensus(mid, match, data, user, role, points, rule)
 
     log = {
         "id": new_id(),
@@ -1531,6 +2390,8 @@ async def add_action(mid: str, data: ScoreActionIn, user=Depends(require_roles("
     elif data.action_type == "penalty" and data.code == "peringatan_3":
         opponent = "blue" if data.corner == "red" else "red"
         await _finish_match_decision(match, opponent, "menang_diskualifikasi")
+    elif int(points or 0) != 0:
+        await _maybe_technical_win(match, rule, log["id"])
     await broadcast_match_update(mid, "score_update")
     log.pop("_id", None)
     return log
@@ -1542,7 +2403,29 @@ async def list_logs(mid: str, user=Depends(get_current_user)):
 
 @api.post("/matches/{mid}/logs/{log_id}/invalidate")
 async def invalidate_log(mid: str, log_id: str, user=Depends(require_roles("head_jury", "admin"))):
-    await db.score_logs.update_one({"id": log_id, "match_id": mid}, {"$set": {"valid": False, "corrected_by": user["id"], "corrected_at": now_iso()}})
+    match = await db.matches.find_one({"id": mid})
+    if not match:
+        raise HTTPException(404, "Match tidak ditemukan")
+    if match.get("status") == "approved":
+        raise HTTPException(400, "Partai yang sudah disahkan tidak dapat dikoreksi")
+    log = await db.score_logs.find_one({"id": log_id, "match_id": mid})
+    if not log:
+        raise HTTPException(404, "Log tidak ditemukan")
+    was_valid = log.get("valid", True)
+    await db.score_logs.update_one(
+        {"id": log_id, "match_id": mid},
+        {"$set": {"valid": False, "corrected_by": user["id"], "corrected_at": now_iso()}},
+    )
+    decisive = log.get("action_type") == "absolute_win" or (
+        log.get("action_type") == "penalty" and log.get("code") == "peringatan_3"
+    ) or bool(log.get("technical_win"))
+    if was_valid and match.get("status") == "finished" and decisive:
+        await db.matches.update_one({"id": mid}, {"$set": {
+            "status": "paused",
+            "winner_corner": None,
+            "decision_method": None,
+            "finished_at": None,
+        }})
     await broadcast_match_update(mid, "correction")
     return {"ok": True}
 
@@ -1552,11 +2435,11 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
     match = await db.matches.find_one({"id": mid})
     if not match:
         raise HTTPException(404, "Match tidak ditemukan")
-    if data.action in ("start", "resume") and match.get("status") in ("approved", "finished"):
-        raise HTTPException(400, "Partai yang sudah selesai atau disahkan tidak dapat dimulai lagi")
+    if match.get("status") in ("approved", "finished"):
+        raise HTTPException(400, "Partai yang sudah selesai atau disahkan sudah dikunci")
     match = await settle_expired_timer(match)
     rule = await db.scoring_rules.find_one({"id": match["scoring_rule_id"]}) or {}
-    round_duration = rule.get("round_duration_sec", 120)
+    round_duration = _match_round_duration(match, rule)
     total_rounds = rule.get("round_count", 3)
 
     timer = match.get("timer", {"running": False, "remaining_sec": round_duration, "round": 1, "started_at": None})
@@ -1568,11 +2451,20 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
 
     update = {}
     if data.action == "start":
-        if not timer.get("running"):
+        if (timer.get("phase") or "round") == "rest":
+            timer = {
+                "running": True,
+                "remaining_sec": round_duration,
+                "started_at": now.isoformat(),
+                "round": timer.get("round", match.get("current_round", 1)),
+                "phase": "round",
+            }
+        elif not timer.get("running"):
             if timer.get("remaining_sec", 0) <= 0:
                 timer["remaining_sec"] = round_duration
             timer["running"] = True
             timer["started_at"] = now.isoformat()
+            timer["phase"] = timer.get("phase") or "round"
         update["status"] = "in_progress"
         if not match.get("started_at"):
             update["started_at"] = now.isoformat()
@@ -1585,13 +2477,40 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
             timer["started_at"] = now.isoformat()
         update["status"] = "in_progress"
     elif data.action == "reset":
-        timer = {"running": False, "remaining_sec": round_duration, "round": match.get("current_round", 1), "started_at": None}
+        phase = timer.get("phase") or "round"
+        duration = int(rule.get("rest_duration_sec") or 0) if phase == "rest" else round_duration
+        timer = {
+            "running": False,
+            "remaining_sec": duration,
+            "round": match.get("current_round", 1),
+            "started_at": None,
+            "phase": phase,
+        }
     elif data.action == "next_round":
         consume_running()
         cur = match.get("current_round", 1)
         if cur < total_rounds:
             cur += 1
-            timer = {"running": False, "remaining_sec": round_duration, "round": cur, "started_at": None}
+            try:
+                rest = int(rule.get("rest_duration_sec") or 0)
+            except (TypeError, ValueError):
+                rest = 0
+            if rest > 0:
+                timer = {
+                    "running": False,
+                    "remaining_sec": rest,
+                    "round": cur,
+                    "started_at": None,
+                    "phase": "rest",
+                }
+            else:
+                timer = {
+                    "running": False,
+                    "remaining_sec": round_duration,
+                    "round": cur,
+                    "started_at": None,
+                    "phase": "round",
+                }
             update["current_round"] = cur
             update["status"] = "paused"
         else:
@@ -1625,6 +2544,8 @@ async def approve_match(mid: str, data: ApproveIn, user=Depends(require_roles("h
             winner = "blue"
         else:
             winner = "draw"
+    if match.get("bracket_id") and winner not in ("red", "blue"):
+        raise HTTPException(400, "Hasil seri pada partai bagan ditolak. Ketua juri wajib menunjuk sudut merah atau biru.")
     update = {
         "status": "approved",
         "winner_corner": winner,
@@ -1638,14 +2559,25 @@ async def approve_match(mid: str, data: ApproveIn, user=Depends(require_roles("h
         update["finished_at"] = now_iso()
     await db.matches.update_one({"id": mid}, {"$set": update})
     await broadcast_match_update(mid, "approved")
-    # Bracket advancement: if this match is part of a bracket, push winner up
-    if match.get("bracket_id") and match.get("bracket_slot_id") and winner in ("red", "blue"):
-        try:
-            winner_athlete_id = match["red_athlete_id"] if winner == "red" else match["blue_athlete_id"]
-            await _bracket_advance_winner(match["bracket_id"], match["bracket_slot_id"], winner_athlete_id)
-        except Exception as e:
-            print(f"[bracket] advance error: {e}")
-    return await compute_match_state(mid)
+    bracket_warning = None
+    if match.get("bracket_id") and winner in ("red", "blue"):
+        winner_athlete_id = match["red_athlete_id"] if winner == "red" else match.get("blue_athlete_id")
+        if not match.get("bracket_slot_id") or not winner_athlete_id:
+            logger.error(
+                "Gagal memajukan pemenang bagan pada partai %s: slot=%s atlet=%s",
+                mid, match.get("bracket_slot_id"), winner_athlete_id,
+            )
+            bracket_warning = "Pemenang tidak masuk ke babak berikutnya. Periksa bagan."
+        else:
+            try:
+                await _bracket_advance_winner(match["bracket_id"], match["bracket_slot_id"], winner_athlete_id)
+            except Exception:
+                logger.exception("Gagal memajukan pemenang bagan pada partai %s", mid)
+                bracket_warning = "Pemenang tidak masuk ke babak berikutnya. Periksa bagan."
+    result = await compute_match_state(mid)
+    if bracket_warning:
+        result["bracket_warning"] = bracket_warning
+    return result
 
 # ============ Routes: Brackets ============
 import math
@@ -1798,7 +2730,7 @@ async def _create_bracket_match(bracket: Dict[str, Any], destination: Dict[str, 
         "bracket_slot_id": destination["id"],
         "status": "scheduled",
         "current_round": 1,
-        "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1},
+        "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1, "phase": "round"},
         "winner_corner": None,
         "decision_method": None,
         "approved_by": None, "approved_at": None,
@@ -1806,8 +2738,7 @@ async def _create_bracket_match(bracket: Dict[str, Any], destination: Dict[str, 
         "created_at": now_iso(),
     }
     rule = await db.scoring_rules.find_one({"id": bracket["scoring_rule_id"]})
-    if rule:
-        match["timer"]["remaining_sec"] = rule.get("round_duration_sec", 120)
+    match["timer"]["remaining_sec"] = _match_round_duration(match, rule)
     await db.matches.insert_one(match)
     await db.bracket_slots.update_one({"id": source_a["id"]}, {"$set": {"match_id": match["id"]}})
     await db.bracket_slots.update_one({"id": source_b["id"]}, {"$set": {"match_id": match["id"]}})
@@ -1848,7 +2779,11 @@ async def get_bracket(bid: str, user=Depends(get_current_user)):
 async def public_get_bracket(bid: str):
     b = await db.brackets.find_one({"id": bid}, {"_id": 0})
     if not b: raise HTTPException(404, "Bracket tidak ditemukan")
-    return await _hydrate_bracket(b)
+    hydrated = await _hydrate_bracket(b)
+    for slot in hydrated.get("slots") or []:
+        if slot.get("athlete"):
+            slot["athlete"] = _redact_public_athlete(slot["athlete"])
+    return hydrated
 
 @api.get("/public/brackets")
 async def public_list_brackets(event_id: Optional[str] = None):
@@ -1872,6 +2807,8 @@ async def assign_slot(bid: str, sid: str, data: BracketSlotAssignIn, user=Depend
 async def start_bracket(bid: str, user=Depends(require_roles("admin", "operator"))):
     b = await db.brackets.find_one({"id": bid})
     if not b: raise HTTPException(404, "Bracket tidak ditemukan")
+    if (b.get("discipline") or "tanding") != "tanding":
+        raise HTTPException(400, "Bagan gugur hanya untuk kategori tanding")
     if b.get("status") not in ("draft",):
         raise HTTPException(400, "Bracket sudah dimulai atau selesai")
     if not (b.get("arena_id") and b.get("scoring_rule_id")):
@@ -1907,13 +2844,13 @@ async def start_bracket(bid: str, user=Depends(require_roles("admin", "operator"
                 "round_label": f"{b['name']} · R1",
                 "bracket_id": bid, "bracket_slot_id": parent["id"] if parent else None,
                 "status": "scheduled", "current_round": 1,
-                "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1},
+                "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1, "phase": "round"},
                 "winner_corner": None, "decision_method": None,
                 "approved_by": None, "approved_at": None, "started_at": None, "finished_at": None,
                 "created_at": now_iso(),
             }
             rule = await db.scoring_rules.find_one({"id": b["scoring_rule_id"]})
-            if rule: match["timer"]["remaining_sec"] = rule.get("round_duration_sec", 120)
+            match["timer"]["remaining_sec"] = _match_round_duration(match, rule)
             await db.matches.insert_one(match)
             # Mark match_id on the LOWER slot (a) so we can find it (we use a's id as marker for the pair's match)
             await db.bracket_slots.update_one({"id": a["id"]}, {"$set": {"match_id": match["id"]}})
@@ -1922,14 +2859,228 @@ async def start_bracket(bid: str, user=Depends(require_roles("admin", "operator"
     return await _hydrate_bracket(await db.brackets.find_one({"id": bid}, {"_id": 0}))
 
 @api.delete("/brackets/{bid}")
-async def delete_bracket(bid: str, user=Depends(require_roles("admin"))):
+async def delete_bracket(bid: str, user=Depends(require_roles("admin", "operator"))):
     b = await db.brackets.find_one({"id": bid})
     if not b: raise HTTPException(404, "Bracket tidak ditemukan")
-    if b.get("status") not in ("draft",):
-        raise HTTPException(400, "Hanya bracket draft yang dapat dihapus")
-    await db.brackets.delete_one({"id": bid})
+    matches = await db.matches.find({"bracket_id": bid}, {"id": 1}).to_list(5000)
+    match_ids = [m["id"] for m in matches]
+    if match_ids:
+        await db.score_logs.delete_many({"match_id": {"$in": match_ids}})
+        await db.score_votes.delete_many({"match_id": {"$in": match_ids}})
+        await db.seni_scores.delete_many({"match_id": {"$in": match_ids}})
+        await db.seni_penalties.delete_many({"match_id": {"$in": match_ids}})
+        await db.matches.delete_many({"bracket_id": bid})
     await db.bracket_slots.delete_many({"bracket_id": bid})
+    await db.brackets.delete_one({"id": bid})
     return {"ok": True}
+
+# ============ Medals ============
+_PLACE_LABEL = {1: "Juara 1", 2: "Juara 2", 3: "Juara 3"}
+
+def _other_corner_athlete(match: Dict[str, Any], winner_id: Optional[str]) -> Optional[str]:
+    """Athlete who lost this match, given the athlete who advanced."""
+    red = match.get("red_athlete_id") or None
+    blue = match.get("blue_athlete_id") or None
+    if winner_id and winner_id == red and blue and blue != winner_id:
+        return blue
+    if winner_id and winner_id == blue and red and red != winner_id:
+        return red
+    corner = match.get("winner_corner")
+    if corner == "red" and blue and blue != winner_id:
+        return blue
+    if corner == "blue" and red and red != winner_id:
+        return red
+    return None
+
+def _seni_performer_ids(match: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    if match.get("red_athlete_id"):
+        ids.append(match["red_athlete_id"])
+    for pid in match.get("performer_ids") or []:
+        if pid and pid not in ids:
+            ids.append(pid)
+    return ids
+
+def _medal_athlete(doc: Optional[Dict[str, Any]], contingent_names: Dict[str, str]) -> Dict[str, Any]:
+    if not doc:
+        return {"id": "", "name": "Peserta tidak ditemukan", "photo_url": "", "gender": "", "weight": None, "contingent_id": "", "contingent_name": ""}
+    out = _redact_public_athlete(doc) or {}
+    out["contingent_name"] = contingent_names.get(doc.get("contingent_id") or "", "")
+    return out
+
+async def _event_medals(eid: str) -> Dict[str, Any]:
+    """Tanding medals from completed brackets. Seni medals are the top three approved scores per class."""
+    event = await db.events.find_one({"id": eid}, {"_id": 0, "id": 1, "name": 1})
+    if not event:
+        raise HTTPException(404, "Event tidak ditemukan")
+
+    raw_brackets = await db.brackets.find({"event_id": eid, "status": "completed"}, {"_id": 0}).to_list(500)
+    brackets = [b for b in raw_brackets if (b.get("discipline") or "tanding") == "tanding"]
+    bracket_ids = [b["id"] for b in brackets]
+    slots: List[Dict[str, Any]] = []
+    bracket_matches: List[Dict[str, Any]] = []
+    if bracket_ids:
+        slots = await db.bracket_slots.find({"bracket_id": {"$in": bracket_ids}}, {"_id": 0}).to_list(8000)
+        bracket_matches = await db.matches.find(
+            {"bracket_id": {"$in": bracket_ids}, "status": "approved"},
+            {"_id": 0, "id": 1, "bracket_id": 1, "bracket_slot_id": 1, "red_athlete_id": 1, "blue_athlete_id": 1, "winner_corner": 1, "approved_at": 1},
+        ).to_list(5000)
+
+    slots_by_bracket: Dict[str, List[Dict[str, Any]]] = {}
+    for slot in slots:
+        slots_by_bracket.setdefault(slot["bracket_id"], []).append(slot)
+    match_by_slot: Dict[tuple, Dict[str, Any]] = {}
+    for match in bracket_matches:
+        key = (match.get("bracket_id"), match.get("bracket_slot_id"))
+        prev = match_by_slot.get(key)
+        if not prev or (match.get("approved_at") or "") >= (prev.get("approved_at") or ""):
+            match_by_slot[key] = match
+
+    athlete_ids: set = set()
+    class_ids: set = set()
+    category_ids: set = set()
+    tanding_raw: List[Dict[str, Any]] = []
+
+    for bracket in brackets:
+        bslots = slots_by_bracket.get(bracket["id"], [])
+        if not bslots:
+            continue
+        max_round = max(int(s.get("round") or 0) for s in bslots)
+        finals = [s for s in bslots if int(s.get("round") or 0) == max_round]
+        finals.sort(key=lambda s: int(s.get("position") or 0))
+        final_slot = finals[0]
+        final_match = match_by_slot.get((bracket["id"], final_slot["id"]))
+        gold_id = bracket.get("winner_athlete_id") or final_slot.get("athlete_id")
+        if not gold_id and final_match:
+            corner = final_match.get("winner_corner")
+            if corner == "red":
+                gold_id = final_match.get("red_athlete_id")
+            elif corner == "blue":
+                gold_id = final_match.get("blue_athlete_id")
+        silver_id = _other_corner_athlete(final_match, gold_id) if final_match else None
+        if silver_id == gold_id:
+            silver_id = None
+
+        bronze_ids: List[str] = []
+        for source_id in (final_slot.get("source_a"), final_slot.get("source_b")):
+            if not source_id:
+                continue
+            semi = match_by_slot.get((bracket["id"], source_id))
+            if not semi:
+                continue
+            dest = next((s for s in bslots if s.get("id") == source_id), None)
+            advanced = (dest or {}).get("athlete_id")
+            if not advanced:
+                corner = semi.get("winner_corner")
+                if corner == "red":
+                    advanced = semi.get("red_athlete_id")
+                elif corner == "blue":
+                    advanced = semi.get("blue_athlete_id")
+            loser = _other_corner_athlete(semi, advanced)
+            if loser and loser not in bronze_ids and loser not in (gold_id, silver_id):
+                bronze_ids.append(loser)
+
+        places: List[tuple] = []
+        if gold_id:
+            places.append((1, gold_id))
+            athlete_ids.add(gold_id)
+        if silver_id:
+            places.append((2, silver_id))
+            athlete_ids.add(silver_id)
+        for bronze_id in bronze_ids:
+            places.append((3, bronze_id))
+            athlete_ids.add(bronze_id)
+        if not places:
+            continue
+        if bracket.get("class_id"):
+            class_ids.add(bracket["class_id"])
+        if bracket.get("category_id"):
+            category_ids.add(bracket["category_id"])
+        tanding_raw.append({"bracket": bracket, "places": places})
+
+    seni_matches = await db.matches.find(
+        {"event_id": eid, "status": "approved", "discipline": {"$in": ["tunggal", "ganda", "regu"]}},
+        {"_id": 0},
+    ).to_list(5000)
+    seni_groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for match in seni_matches:
+        key = (match.get("class_id") or "", match.get("discipline") or "tunggal")
+        seni_groups.setdefault(key, []).append(match)
+        if match.get("class_id"):
+            class_ids.add(match["class_id"])
+        if match.get("category_id"):
+            category_ids.add(match["category_id"])
+        for aid in _seni_performer_ids(match):
+            athlete_ids.add(aid)
+
+    class_names = await _lookup_names(db.classes, class_ids)
+    category_names = await _lookup_names(db.categories, category_ids)
+    athletes = await db.athletes.find({"id": {"$in": list(athlete_ids)}}, {"_id": 0}).to_list(max(len(athlete_ids), 1)) if athlete_ids else []
+    athlete_by_id = {a["id"]: a for a in athletes}
+    contingent_names = await _lookup_names(db.contingents, {a.get("contingent_id") for a in athletes})
+
+    def pack(aid: Optional[str]) -> Dict[str, Any]:
+        athlete = _medal_athlete(athlete_by_id.get(aid) if aid else None, contingent_names)
+        if aid and not athlete.get("id"):
+            athlete["id"] = aid
+        return athlete
+
+    tanding = []
+    for row in tanding_raw:
+        bracket = row["bracket"]
+        tanding.append({
+            "bracket_id": bracket["id"],
+            "name": bracket.get("name") or "",
+            "class_id": bracket.get("class_id"),
+            "class_name": class_names.get(bracket.get("class_id") or "", ""),
+            "category_id": bracket.get("category_id"),
+            "category_name": category_names.get(bracket.get("category_id") or "", ""),
+            "places": [
+                {"place": place, "label": _PLACE_LABEL[place], "athlete": pack(aid)}
+                for place, aid in row["places"]
+            ],
+        })
+    tanding.sort(key=lambda g: ((g["category_name"] or ""), (g["class_name"] or ""), (g["name"] or "")))
+
+    discipline_order = {"tunggal": 0, "ganda": 1, "regu": 2}
+    seni = []
+    for (class_id, discipline), rows in seni_groups.items():
+        rows.sort(key=lambda m: (-float(m.get("seni_final_score") or 0), m.get("approved_at") or "", m.get("id") or ""))
+        top = rows[:3]
+        category_id = next((m.get("category_id") for m in top if m.get("category_id")), None)
+        places = []
+        for index, match in enumerate(top, start=1):
+            places.append({
+                "place": index,
+                "label": _PLACE_LABEL[index],
+                "score": float(match.get("seni_final_score") or 0),
+                "match_id": match.get("id"),
+                "athletes": [pack(aid) for aid in _seni_performer_ids(match)],
+            })
+        seni.append({
+            "class_id": class_id or None,
+            "class_name": class_names.get(class_id, ""),
+            "category_id": category_id,
+            "category_name": category_names.get(category_id or "", ""),
+            "discipline": discipline,
+            "places": places,
+        })
+    seni.sort(key=lambda g: (discipline_order.get(g["discipline"], 9), g["category_name"] or "", g["class_name"] or ""))
+
+    return {
+        "event_id": event["id"],
+        "event_name": event.get("name") or "",
+        "tanding": tanding,
+        "seni": seni,
+    }
+
+@api.get("/events/{eid}/medals")
+async def event_medals(eid: str, user=Depends(require_roles("admin", "operator"))):
+    return await _event_medals(eid)
+
+@api.get("/public/events/{eid}/medals")
+async def public_event_medals(eid: str):
+    return await _event_medals(eid)
 
 # ============ Routes: Seni Scoring (Tunggal/Ganda/Regu) ============
 async def _seni_summary(mid: str) -> Dict[str, Any]:
@@ -1976,17 +3127,29 @@ async def get_seni(mid: str, user=Depends(get_current_user)):
     summary = await _seni_summary(mid)
     return await _attach_match_athletes(summary, match)
 
+def _reject_locked_seni(match: Dict[str, Any]) -> None:
+    if match.get("status") == "approved":
+        raise HTTPException(400, "Nilai seni sudah disahkan dan tidak dapat diubah")
+
 @api.get("/public/matches/{mid}/seni")
 async def public_get_seni(mid: str):
     match = await db.matches.find_one({"id": mid}, {"_id": 0})
     if not match: raise HTTPException(404, "Match tidak ditemukan")
     summary = await _seni_summary(mid)
-    return await _attach_match_athletes(summary, match)
+    attached = await _attach_match_athletes(summary, match)
+    redacted = []
+    for athlete in attached.get("athletes") or []:
+        public_athlete = _redact_public_athlete(athlete)
+        if public_athlete:
+            redacted.append(public_athlete)
+    attached["athletes"] = redacted
+    return attached
 
 @api.post("/matches/{mid}/seni/score")
 async def post_seni_score(mid: str, data: SeniScoreIn, user=Depends(require_roles("jury", "head_jury", "admin"))):
     match = await db.matches.find_one({"id": mid})
     if not match: raise HTTPException(404, "Match tidak ditemukan")
+    _reject_locked_seni(match)
     total = round(float(data.teknik) + float(data.wirama) + float(data.penghayatan), 2)
     doc = {
         "match_id": mid,
@@ -2012,6 +3175,9 @@ async def post_seni_score(mid: str, data: SeniScoreIn, user=Depends(require_role
 
 @api.delete("/matches/{mid}/seni/score")
 async def delete_my_seni_score(mid: str, user=Depends(require_roles("jury", "head_jury", "admin"))):
+    match = await db.matches.find_one({"id": mid})
+    if not match: raise HTTPException(404, "Match tidak ditemukan")
+    _reject_locked_seni(match)
     await db.seni_scores.delete_one({"match_id": mid, "jury_id": user["id"]})
     await broadcast_match_update(mid, "seni_score_deleted")
     return await _seni_summary(mid)
@@ -2020,6 +3186,7 @@ async def delete_my_seni_score(mid: str, user=Depends(require_roles("jury", "hea
 async def post_seni_penalty(mid: str, data: SeniPenaltyIn, user=Depends(require_roles("head_jury", "admin"))):
     match = await db.matches.find_one({"id": mid})
     if not match: raise HTTPException(404, "Match tidak ditemukan")
+    _reject_locked_seni(match)
     doc = {
         "id": new_id(), "match_id": mid,
         "code": data.code, "value": float(data.value),
@@ -2033,6 +3200,9 @@ async def post_seni_penalty(mid: str, data: SeniPenaltyIn, user=Depends(require_
 
 @api.delete("/matches/{mid}/seni/penalty/{pid}")
 async def delete_seni_penalty(mid: str, pid: str, user=Depends(require_roles("head_jury", "admin"))):
+    match = await db.matches.find_one({"id": mid})
+    if not match: raise HTTPException(404, "Match tidak ditemukan")
+    _reject_locked_seni(match)
     await db.seni_penalties.delete_one({"id": pid, "match_id": mid})
     await broadcast_match_update(mid, "seni_penalty_deleted")
     return await _seni_summary(mid)
@@ -2041,12 +3211,13 @@ async def delete_seni_penalty(mid: str, pid: str, user=Depends(require_roles("he
 async def finalize_seni(mid: str, user=Depends(require_roles("head_jury", "admin"))):
     match = await db.matches.find_one({"id": mid})
     if not match: raise HTTPException(404, "Match tidak ditemukan")
+    _reject_locked_seni(match)
     summary = await _seni_summary(mid)
-    if summary["jury_count"] == 0:
-        raise HTTPException(400, "Belum ada nilai juri")
+    if summary["jury_count"] < 3:
+        raise HTTPException(400, "Minimal 3 juri untuk mengesahkan nilai seni")
     update = {
         "status": "approved",
-        "winner_corner": "red",
+        "winner_corner": None,
         "decision_method": "seni",
         "approved_by": user["id"],
         "approved_by_name": user.get("name", ""),
@@ -2058,12 +3229,6 @@ async def finalize_seni(mid: str, user=Depends(require_roles("head_jury", "admin
     }
     await db.matches.update_one({"id": mid}, {"$set": update})
     await broadcast_match_update(mid, "seni_finalized")
-    # Bracket advance if linked
-    if match.get("bracket_id") and match.get("bracket_slot_id"):
-        try:
-            await _bracket_advance_winner(match["bracket_id"], match["bracket_slot_id"], match["red_athlete_id"])
-        except Exception as e:
-            print(f"[bracket] advance error: {e}")
     return await _seni_summary(mid)
 
 # ============ WebSocket endpoints ============
@@ -2076,8 +3241,9 @@ async def ws_arena(websocket: WebSocket, arena_id: str):
         m = await db.matches.find_one({"arena_id": arena_id, "status": {"$in": ["in_progress", "paused"]}})
         if m:
             await settle_expired_timer(m)
-            state = await compute_match_state(m["id"])
-            await websocket.send_text(json.dumps({"type": "initial", "match_id": m["id"], "state": state}, default=str))
+            state = redact_public_match(await compute_match_state(m["id"]))
+            if state:
+                await websocket.send_text(json.dumps({"type": "initial", "match_id": m["id"], "state": state}, default=str))
         while True:
             await websocket.receive_text()  # keepalive
     except WebSocketDisconnect:
@@ -2100,6 +3266,23 @@ async def ws_match(websocket: WebSocket, match_id: str):
     except Exception:
         await manager.disconnect(room, websocket)
 
+@app.websocket("/api/ws/public/match/{match_id}")
+async def ws_public_match(websocket: WebSocket, match_id: str):
+    """Public scoreboard socket. Jury room /ws/match stays complete, including pending votes."""
+    room = f"public:{match_id}"
+    await manager.connect(room, websocket)
+    try:
+        await _load_match_settled(match_id)
+        state = redact_public_match(await compute_match_state(match_id))
+        if state:
+            await websocket.send_text(json.dumps({"type": "initial", "match_id": match_id, "state": state}, default=str))
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await manager.disconnect(room, websocket)
+    except Exception:
+        await manager.disconnect(room, websocket)
+
 # ============ Health ============
 @api.get("/")
 async def root():
@@ -2107,9 +3290,6 @@ async def root():
 
 # Register router
 app.include_router(api)
-
-# Serve uploaded files
-app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # CORS
 app.add_middleware(
@@ -2142,13 +3322,14 @@ async def startup():
     await db.score_votes.create_index([("match_id", 1), ("timestamp", 1)])
     await ensure_event_public_defaults()
     await seed_admin()
-    await seed_demo_users()
+    if env_flag("SEED_DEMO"):
+        await seed_demo_users()
     await seed_demo_event()
     await seed_example_events()
     global _expire_task
     if _expire_task is None or _expire_task.done():
         _expire_task = asyncio.create_task(_expire_running_matches_loop())
-    logger.info("Startup complete: admin + demo seed done")
+    logger.info("Startup complete")
 
 async def ensure_event_public_defaults():
     events = await db.events.find({}, {"_id": 0}).to_list(5000)
@@ -2178,18 +3359,18 @@ async def ensure_event_public_defaults():
             await db.events.update_one({"id": event["id"]}, {"$set": updates})
 
 async def seed_admin():
-    existing = await db.users.find_one({"email": ADMIN_EMAIL})
-    if not existing:
-        await db.users.insert_one({
-            "id": new_id(),
-            "email": ADMIN_EMAIL,
-            "password_hash": hash_password(ADMIN_PASSWORD),
-            "name": "Administrator",
-            "role": "admin",
-            "created_at": now_iso(),
-        })
-    elif not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
-        await db.users.update_one({"email": ADMIN_EMAIL}, {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}})
+    """Create the admin account once. A password changed in the app is left alone on restart."""
+    existing = await db.users.find_one({"email": ADMIN_EMAIL}, {"_id": 1})
+    if existing:
+        return
+    await db.users.insert_one({
+        "id": new_id(),
+        "email": ADMIN_EMAIL,
+        "password_hash": hash_password(ADMIN_PASSWORD),
+        "name": "Administrator",
+        "role": "admin",
+        "created_at": now_iso(),
+    })
 
 async def seed_demo_users():
     demos = [
@@ -2255,8 +3436,14 @@ async def seed_example_events():
                     await db[col].insert_one(dict(doc))
 
 async def seed_demo_event():
-    # Only seed once
-    if await db.events.find_one({"name": "Kejuaraan Nasional Pencak Silat 2026 (Demo)"}):
+    # Only seed once. Match name, code, or slug so a renamed demo event is not inserted again.
+    if await db.events.find_one({
+        "$or": [
+            {"name": "Kejuaraan Nasional Pencak Silat 2026 (Demo)"},
+            {"code": "KEJURNAS2026"},
+            {"slug": "kejurnas-pencak-silat-2026"},
+        ]
+    }):
         return
     event_id = new_id()
     await db.events.insert_one({
@@ -2290,6 +3477,8 @@ async def seed_demo_event():
         "round_count": 3,
         "round_duration_sec": 120,
         "rest_duration_sec": 60,
+        "jury_consensus_window_sec": 2,
+        "technical_win_margin": 0,
         "points": {"pukulan": 1, "tendangan": 2, "jatuhan": 3},
         "penalty_points": {"teguran_1": 1, "teguran_2": 2, "peringatan_1": 5, "peringatan_2": 10, "peringatan_3": 0},
         "binaan_limit": 2,
@@ -2334,7 +3523,7 @@ async def seed_demo_event():
         "round_label": "Babak Penyisihan",
         "status": "scheduled",
         "current_round": 1,
-        "timer": {"running": False, "remaining_sec": 120, "round": 1, "started_at": None},
+        "timer": {"running": False, "remaining_sec": 120, "round": 1, "started_at": None, "phase": "round"},
         "winner_corner": None,
         "decision_method": None,
         "approved_by": None,
