@@ -54,6 +54,21 @@ def demo_event(admin_tok):
     return ev
 
 
+@pytest.fixture(scope="module")
+def seni_category(admin_tok, demo_event):
+    """Non-tanding category so class and weight stay optional for older registration flows."""
+    created = requests.post(f"{API}/categories", headers=H(admin_tok), json={
+        "event_id": demo_event["id"],
+        "name": "TEST_SeniDaftar",
+        "type": "tunggal",
+        "gender": "campuran",
+    })
+    assert created.status_code == 200, created.text
+    cat = created.json()
+    yield cat
+    requests.delete(f"{API}/categories/{cat['id']}", headers=H(admin_tok))
+
+
 # Tiny 1x1 PNG bytes
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
@@ -87,12 +102,13 @@ class TestPublicUpload:
 class TestPublicRegistration:
     """Creates registrations sequentially and verifies counter format."""
 
-    def test_create_increments_and_format(self, demo_event):
+    def test_create_increments_and_format(self, demo_event, seni_category):
         # Two fresh registrations; numbers should be REG-DEMO-NNN and increment
         nums = []
         for i in range(2):
             payload = {
                 "event_id": demo_event["id"],
+                "category_id": seni_category["id"],
                 "contingent_name": f"TEST_PublicCont_{i}",
                 "name": f"TEST_PublicAthlete_{int(time.time())}_{i}",
                 "gender": "putra",
@@ -195,10 +211,11 @@ def _local_db():
 
 
 class TestLegacyAccessCode:
-    def test_opening_detail_mints_code_once(self, admin_tok, operator_tok, demo_event):
+    def test_opening_detail_mints_code_once(self, admin_tok, operator_tok, demo_event, seni_category):
         db = _local_db()
         created = requests.post(f"{API}/public/registrations", json={
             "event_id": demo_event["id"],
+            "category_id": seni_category["id"],
             "contingent_name": "TEST_LegacyCont",
             "name": f"TEST_Legacy_{int(time.time())}",
             "gender": "putri",
@@ -322,10 +339,11 @@ class TestAdminTransitions:
         assert isinstance(regs, list) and len(regs) >= 1
         assert all(x["status"] == "pending_verification" for x in regs)
 
-    def test_status_transitions_history(self, admin_tok, demo_event):
+    def test_status_transitions_history(self, admin_tok, demo_event, seni_category):
         # Create new reg
         payload = {
             "event_id": demo_event["id"],
+            "category_id": seni_category["id"],
             "contingent_name": "TEST_TransitionCont",
             "name": f"TEST_Transition_{int(time.time())}",
             "gender": "putra",
@@ -581,8 +599,8 @@ class TestRegistrationPlacement:
             "name": f"TEST_BlankIds_{time.time_ns()}",
             "gender": "putra",
         })
-        assert created.status_code == 200, created.text
-        requests.delete(f"{API}/registrations/{created.json()['id']}", headers=H(_login("admin@silat.id", "admin123")))
+        assert created.status_code == 400, created.text
+        assert "kategori" in created.text.lower()
 
     def test_gender_must_match_category_except_campuran(self, admin_tok, demo_event):
         h = H(admin_tok)
@@ -649,9 +667,10 @@ class TestRegistrationPlacement:
             requests.delete(f"{API}/categories/{campuran['id']}", headers=h)
             requests.delete(f"{API}/events/{other['id']}", headers=h)
 
-    def test_field_length_limits(self, demo_event):
+    def test_field_length_limits(self, demo_event, seni_category):
         base = {
             "event_id": demo_event["id"],
+            "category_id": seni_category["id"],
             "contingent_name": "TEST_Len",
             "gender": "putra",
         }
@@ -680,13 +699,14 @@ class TestRegistrationPlacement:
 
 # ===================== Convert to athlete =====================
 class TestConvert:
-    def test_convert_accepted_creates_athlete_and_contingent(self, admin_tok, demo_event):
+    def test_convert_accepted_creates_athlete_and_contingent(self, admin_tok, demo_event, seni_category):
         h = H(admin_tok)
         eid = demo_event["id"]
         cname = f"TEST_AutoCont_{int(time.time())}"
         # New reg with contingent_name only
         reg = requests.post(f"{API}/public/registrations", json={
             "event_id": eid,
+            "category_id": seni_category["id"],
             "contingent_name": cname,
             "name": f"TEST_Convert_{int(time.time())}",
             "gender": "putra",
@@ -720,10 +740,11 @@ class TestConvert:
         if cid:
             requests.delete(f"{API}/contingents/{cid}", headers=h)
 
-    def test_convert_refuses_non_accepted(self, admin_tok, demo_event):
+    def test_convert_refuses_non_accepted(self, admin_tok, demo_event, seni_category):
         h = H(admin_tok)
         reg = requests.post(f"{API}/public/registrations", json={
             "event_id": demo_event["id"],
+            "category_id": seni_category["id"],
             "contingent_name": "TEST_NopeCont",
             "name": f"TEST_Nope_{int(time.time())}",
             "gender": "putri",

@@ -332,6 +332,15 @@ REGISTRATION_PHONE_MAX = 32
 REGISTRATION_EMAIL_MAX = 254
 REGISTRATION_ADDRESS_MAX = 500
 OCCUPIED_REGISTRATION_STATUSES = ("accepted", "active_participant")
+# Verified registrants belong on the athlete list. Later selection keeps that row;
+# rejection and a return to revision remove it when the person is not already in a match.
+ATHLETE_SYNC_STATUSES = (
+    "verified",
+    "selection_process",
+    "accepted",
+    "reserve",
+    "active_participant",
+)
 
 
 def _bounded_text(value: Optional[str], limit: int, label: str) -> str:
@@ -1334,6 +1343,7 @@ async def create_athlete(data: AthleteIn, user=Depends(require_roles("admin"))):
 
 @api.get("/athletes")
 async def list_athletes(event_id: Optional[str] = None, user=Depends(get_current_user)):
+    await _backfill_athletes_from_registrations(event_id)
     q = {"event_id": event_id} if event_id else {}
     return await list_collection(db.athletes, q)
 
@@ -1575,6 +1585,12 @@ async def update_registration(rid: str, data: RegistrationIn, user=Depends(requi
         if result.matched_count == 0:
             raise HTTPException(404, "Registrasi tidak ditemukan")
     reg = await db.registrations.find_one({"id": rid}, {"_id": 0})
+    if reg and reg.get("status") in ATHLETE_SYNC_STATUSES:
+        try:
+            await _ensure_athlete_for_registration(reg)
+            reg = await db.registrations.find_one({"id": rid}, {"_id": 0})
+        except Exception as exc:
+            print(f"[athletes] sync failed for reg {rid}: {exc}")
     return await _hydrate_registration(reg)
 
 @api.delete("/registrations/{rid}")
@@ -1605,6 +1621,12 @@ async def delete_registration(rid: str, user=Depends(require_roles("admin"))):
             elif fresh:
                 await db.registrations.delete_one({"id": rid})
     await db.registration_files.delete_many({"registration_id": rid})
+    still = await db.registrations.find_one({"id": rid}, {"_id": 1})
+    if not still and reg:
+        try:
+            await _drop_athlete_for_registration(reg, clear_link=False)
+        except Exception as exc:
+            print(f"[athletes] cleanup failed for reg {rid}: {exc}")
     return {"ok": True}
 
 @api.delete("/registrations/{rid}/files/{fid}")
@@ -1644,26 +1666,67 @@ def _quota_targets(reg: Dict[str, Any]) -> List[tuple]:
     return targets
 
 
-async def _validate_registration_placement(data: RegistrationIn) -> None:
-    """Category and class must belong to the event, and the class must sit in that category.
+def _format_kg(value: float) -> str:
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return format(number, "f").rstrip("0").rstrip(".")
 
-    Category gender is enforced too. `campuran` accepts both putra and putri.
+
+def _weight_bounds(kelas: Dict[str, Any]) -> tuple:
+    try:
+        raw_min = kelas.get("weight_min")
+        raw_max = kelas.get("weight_max")
+        weight_min = float(0 if raw_min is None else raw_min)
+        weight_max = float(0 if raw_max is None else raw_max)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Data kelas rusak: rentang berat tidak valid")
+    return weight_min, weight_max
+
+
+async def _validate_registration_placement(data: RegistrationIn) -> None:
+    """Category is required and must belong to the event. Gender must match (`campuran` accepts both).
+
+    Gender is checked before a missing tanding class. A class range other than 0–0 includes its bounds.
     """
     category_id = _clean_id(data.category_id)
     class_id = _clean_id(data.class_id)
-    if category_id:
-        category = await db.categories.find_one({"id": category_id}, {"_id": 0, "event_id": 1, "gender": 1})
-        if not category or category.get("event_id") != data.event_id:
-            raise HTTPException(400, "Kategori bukan milik event ini")
-        category_gender = category.get("gender") or "putra"
-        if category_gender != "campuran" and data.gender != category_gender:
-            raise HTTPException(400, "Gender peserta tidak sesuai dengan kategori")
-    if class_id:
-        kelas = await db.classes.find_one({"id": class_id}, {"_id": 0, "event_id": 1, "category_id": 1})
-        if not kelas or kelas.get("event_id") != data.event_id:
-            raise HTTPException(400, "Kelas bukan milik event ini")
-        if not category_id or kelas.get("category_id") != category_id:
-            raise HTTPException(400, "Kelas bukan bagian dari kategori yang dipilih")
+    if not category_id:
+        raise HTTPException(400, "Kategori wajib diisi")
+    category = await db.categories.find_one(
+        {"id": category_id},
+        {"_id": 0, "event_id": 1, "gender": 1, "type": 1},
+    )
+    if not category or category.get("event_id") != data.event_id:
+        raise HTTPException(400, "Kategori bukan milik event ini")
+    category_gender = category.get("gender") or "putra"
+    if category_gender != "campuran" and data.gender != category_gender:
+        raise HTTPException(400, "Gender peserta tidak sesuai dengan kategori")
+    if (category.get("type") or "tanding") == "tanding" and not class_id:
+        raise HTTPException(400, "Kelas wajib untuk kategori tanding")
+    if not class_id:
+        return
+    kelas = await db.classes.find_one(
+        {"id": class_id},
+        {"_id": 0, "event_id": 1, "category_id": 1, "name": 1, "weight_min": 1, "weight_max": 1},
+    )
+    if not kelas or kelas.get("event_id") != data.event_id:
+        raise HTTPException(400, "Kelas bukan milik event ini")
+    if kelas.get("category_id") != category_id:
+        raise HTTPException(400, "Kelas bukan bagian dari kategori yang dipilih")
+    weight_min, weight_max = _weight_bounds(kelas)
+    if weight_min > weight_max:
+        raise HTTPException(400, "Data kelas rusak: berat minimum lebih besar dari berat maksimum")
+    if weight_min == 0 and weight_max == 0:
+        return
+    weight = float(data.weight or 0)
+    if weight_min <= weight <= weight_max:
+        return
+    name = (kelas.get("name") or "").strip() or "Kelas"
+    raise HTTPException(
+        400,
+        f"Berat {_format_kg(weight)} kg di luar rentang {name} ({_format_kg(weight_min)}\u2013{_format_kg(weight_max)} kg)",
+    )
 
 
 async def _lookup_quota(scope: str, scope_id: str) -> int:
@@ -1766,6 +1829,144 @@ async def _retarget_acceptance_slots(old_reg: Dict[str, Any], new_reg: Dict[str,
             await _release_quota_slot(scope, scope_id, seed=True)
 
 
+async def _next_participant_number(event_id: str) -> str:
+    ev = await db.events.find_one({"id": event_id}, {"code": 1, "name": 1})
+    code = (ev or {}).get("code") or (ev or {}).get("name") or "EVENT"
+    seq = await next_seq(f"participant:{event_id}")
+    return fmt_number("PST", code, seq)
+
+
+async def _resolve_contingent_id(reg: Dict[str, Any]) -> str:
+    contingent_id = _clean_id(reg.get("contingent_id"))
+    if contingent_id and await db.contingents.find_one({"id": contingent_id}, {"_id": 1}):
+        return contingent_id
+    name = (reg.get("contingent_name") or "").strip() or "Tanpa Kontingen"
+    existing = await db.contingents.find_one({"event_id": reg["event_id"], "name": name}, {"id": 1})
+    if existing:
+        return existing["id"]
+    created = {
+        "id": new_id(),
+        "event_id": reg["event_id"],
+        "name": name,
+        "region": "",
+        "created_at": now_iso(),
+    }
+    await db.contingents.insert_one(created)
+    return created["id"]
+
+
+async def _athlete_category_id(reg: Dict[str, Any]) -> Optional[str]:
+    category_id = _clean_id(reg.get("category_id"))
+    if category_id:
+        return category_id
+    class_id = _clean_id(reg.get("class_id"))
+    if not class_id:
+        return None
+    kelas = await db.classes.find_one({"id": class_id}, {"category_id": 1})
+    return _clean_id((kelas or {}).get("category_id"))
+
+
+async def _ensure_athlete_for_registration(reg: Dict[str, Any]) -> Dict[str, Any]:
+    """Create or refresh the athlete row for a verified registration."""
+    contingent_id = await _resolve_contingent_id(reg)
+    gender = reg.get("gender") if reg.get("gender") in ("putra", "putri") else "putra"
+    try:
+        weight = float(reg.get("weight") or 0)
+    except (TypeError, ValueError):
+        weight = 0.0
+    fields = {
+        "event_id": reg["event_id"],
+        "contingent_id": contingent_id,
+        "class_id": _clean_id(reg.get("class_id")),
+        "category_id": await _athlete_category_id(reg),
+        "name": reg.get("name") or "",
+        "gender": gender,
+        "dob": reg.get("dob"),
+        "weight": weight,
+        "photo_url": reg.get("photo_url") or "",
+        "phone": reg.get("phone") or "",
+        "source": "self_registration",
+        "registration_id": reg["id"],
+        "status": "active",
+    }
+    existing = None
+    if reg.get("athlete_id"):
+        existing = await db.athletes.find_one({"id": reg["athlete_id"]})
+    if not existing:
+        existing = await db.athletes.find_one({"registration_id": reg["id"]})
+    if existing:
+        pnum = (existing.get("participant_number") or reg.get("participant_number") or "").strip()
+        if not pnum:
+            pnum = await _next_participant_number(reg["event_id"])
+        await db.athletes.update_one({"id": existing["id"]}, {"$set": {**fields, "participant_number": pnum}})
+        await db.registrations.update_one(
+            {"id": reg["id"]},
+            {"$set": {"athlete_id": existing["id"], "participant_number": pnum}},
+        )
+        existing.pop("_id", None)
+        existing.update(fields)
+        existing["participant_number"] = pnum
+        return existing
+    pnum = (reg.get("participant_number") or "").strip() or await _next_participant_number(reg["event_id"])
+    athlete = {"id": new_id(), **fields, "participant_number": pnum, "created_at": now_iso()}
+    await db.athletes.insert_one(dict(athlete))
+    await db.registrations.update_one(
+        {"id": reg["id"]},
+        {"$set": {"athlete_id": athlete["id"], "participant_number": pnum}},
+    )
+    return athlete
+
+
+async def _athlete_is_in_use(athlete_id: str) -> bool:
+    used = await db.matches.find_one({"$or": [
+        {"red_athlete_id": athlete_id},
+        {"blue_athlete_id": athlete_id},
+        {"performer_ids": athlete_id},
+    ]}, {"_id": 1})
+    if used:
+        return True
+    slotted = await db.bracket_slots.find_one({"athlete_id": athlete_id}, {"_id": 1})
+    return slotted is not None
+
+
+async def _drop_athlete_for_registration(reg: Dict[str, Any], *, clear_link: bool = True) -> None:
+    athlete = None
+    if reg.get("athlete_id"):
+        athlete = await db.athletes.find_one({"id": reg["athlete_id"]})
+    if not athlete and reg.get("id"):
+        athlete = await db.athletes.find_one({"registration_id": reg["id"], "source": "self_registration"})
+    if not athlete:
+        return
+    athlete_id = athlete["id"]
+    if await _athlete_is_in_use(athlete_id):
+        await db.athletes.update_one({"id": athlete_id}, {"$set": {"status": "inactive"}})
+        return
+    await db.athletes.delete_one({"id": athlete_id})
+    if clear_link and reg.get("id"):
+        await db.registrations.update_one({"id": reg["id"]}, {"$unset": {"athlete_id": ""}})
+
+
+async def _backfill_athletes_from_registrations(event_id: Optional[str] = None) -> None:
+    query: Dict[str, Any] = {"status": {"$in": list(ATHLETE_SYNC_STATUSES)}}
+    if event_id:
+        query["event_id"] = event_id
+    regs = await db.registrations.find(query).to_list(5000)
+    if not regs:
+        return
+    athlete_ids = [row.get("athlete_id") for row in regs if row.get("athlete_id")]
+    linked_ids = set()
+    if athlete_ids:
+        async for doc in db.athletes.find({"id": {"$in": athlete_ids}}, {"id": 1}):
+            linked_ids.add(doc["id"])
+    for reg in regs:
+        if reg.get("athlete_id") in linked_ids:
+            continue
+        try:
+            await _ensure_athlete_for_registration(reg)
+        except Exception as exc:
+            print(f"[athletes] sync failed for reg {reg.get('id')}: {exc}")
+
+
 @api.post("/registrations/{rid}/status")
 async def update_registration_status(rid: str, data: RegistrationUpdateStatusIn, user=Depends(require_roles("admin", "operator"))):
     reg = await db.registrations.find_one({"id": rid})
@@ -1801,6 +2002,14 @@ async def update_registration_status(rid: str, data: RegistrationUpdateStatusIn,
     if leaving:
         await _release_acceptance_slots(reg, seed=False)
     fresh = await db.registrations.find_one({"id": rid}, {"_id": 0})
+    try:
+        if new_status in ATHLETE_SYNC_STATUSES:
+            await _ensure_athlete_for_registration(fresh)
+        elif old_status in ATHLETE_SYNC_STATUSES:
+            await _drop_athlete_for_registration(fresh)
+        fresh = await db.registrations.find_one({"id": rid}, {"_id": 0})
+    except Exception as exc:
+        print(f"[athletes] sync failed for reg {rid}: {exc}")
     # Best-effort WhatsApp notification (skipped if WAHA disabled or no template)
     try:
         await _dispatch_registration_notification(fresh, new_status)
@@ -1822,67 +2031,28 @@ async def convert_to_athlete(rid: str, user=Depends(require_roles("admin", "oper
     if reg.get("status") not in ("accepted", "reserve"):
         raise HTTPException(400, "Hanya registrasi dengan status diterima yang dapat dijadikan peserta aktif")
     acquired = False
-    athlete_id = None
     if reg.get("status") == "reserve":
         await _acquire_acceptance_slots(reg)
         acquired = True
     try:
-        # Resolve or create contingent if only name given
-        contingent_id = reg.get("contingent_id")
-        if not contingent_id and reg.get("contingent_name"):
-            existing = await db.contingents.find_one({"event_id": reg["event_id"], "name": reg["contingent_name"]})
-            if existing:
-                contingent_id = existing["id"]
-            else:
-                new_cont = {
-                    "id": new_id(),
-                    "event_id": reg["event_id"],
-                    "name": reg["contingent_name"],
-                    "region": "",
-                    "created_at": now_iso(),
-                }
-                await db.contingents.insert_one(new_cont)
-                contingent_id = new_cont["id"]
-        if not contingent_id:
-            raise HTTPException(400, "Kontingen registrasi tidak valid")
-        ev = await db.events.find_one({"id": reg["event_id"]}, {"code": 1, "name": 1})
-        code = (ev or {}).get("code") or (ev or {}).get("name") or "EVENT"
-        seq = await next_seq(f"participant:{reg['event_id']}")
-        pnum = fmt_number("PST", code, seq)
-        athlete = {
-            "id": new_id(),
-            "event_id": reg["event_id"],
-            "contingent_id": contingent_id,
-            "class_id": reg.get("class_id"),
-            "category_id": reg.get("category_id"),
-            "name": reg["name"],
-            "gender": reg.get("gender", "putra"),
-            "dob": reg.get("dob"),
-            "weight": float(reg.get("weight") or 0),
-            "photo_url": reg.get("photo_url", ""),
-            "phone": reg.get("phone", ""),
-            "source": "self_registration",
-            "registration_id": rid,
-            "participant_number": pnum,
-            "status": "active",
-            "created_at": now_iso(),
-        }
-        await db.athletes.insert_one(athlete)
-        athlete_id = athlete["id"]
+        athlete = await _ensure_athlete_for_registration(reg)
+        pnum = athlete["participant_number"]
         history_entry = {"status": "active_participant", "at": now_iso(), "by": user["id"], "notes": f"Dikonversi ke peserta aktif {pnum}"}
         result = await db.registrations.update_one({"id": rid, "status": reg.get("status")}, {
-            "$set": {"status": "active_participant", "athlete_id": athlete["id"], "participant_number": pnum, "updated_at": now_iso()},
+            "$set": {
+                "status": "active_participant",
+                "athlete_id": athlete["id"],
+                "participant_number": pnum,
+                "updated_at": now_iso(),
+            },
             "$push": {"history": history_entry},
         })
         if result.matched_count == 0:
             raise HTTPException(409, "Status registrasi berubah, silakan ulangi")
     except Exception:
-        if athlete_id:
-            await db.athletes.delete_one({"id": athlete_id})
         if acquired:
             await _release_acceptance_slots(reg, seed=False)
         raise
-    athlete.pop("_id", None)
     # Best-effort WhatsApp notification when becoming active participant
     try:
         fresh_reg = await db.registrations.find_one({"id": rid}, {"_id": 0})
@@ -3324,8 +3494,8 @@ async def startup():
     await seed_admin()
     if env_flag("SEED_DEMO"):
         await seed_demo_users()
-    await seed_demo_event()
-    await seed_example_events()
+        await seed_demo_event()
+        await seed_example_events()
     global _expire_task
     if _expire_task is None or _expire_task.done():
         _expire_task = asyncio.create_task(_expire_running_matches_loop())

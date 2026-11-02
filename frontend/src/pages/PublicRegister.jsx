@@ -44,6 +44,62 @@ const STATUS_COLOR = {
   active_participant: "bg-[#ffcc00]/15 text-[#ffcc00] border-[#ffcc00]/40",
 };
 
+const GENDER_LABEL = { putra: "Putra", putri: "Putri" };
+
+function formatKg(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  return String(Math.round(n * 1000) / 1000);
+}
+
+function classBounds(cls) {
+  const min = Number(cls?.weight_min);
+  const max = Number(cls?.weight_max);
+  return {
+    min: Number.isFinite(min) ? min : 0,
+    max: Number.isFinite(max) ? max : 0,
+  };
+}
+
+function classHasWeightRange(cls) {
+  if (!cls) return false;
+  const { min, max } = classBounds(cls);
+  return !(min === 0 && max === 0);
+}
+
+function classRangeText(cls) {
+  const { min, max } = classBounds(cls);
+  return `${formatKg(min)}–${formatKg(max)} kg`;
+}
+
+function classOptionLabel(cls) {
+  if (!classHasWeightRange(cls)) return cls.name;
+  return `${cls.name} (${classRangeText(cls)})`;
+}
+
+function weightPlacementMessage(cls, raw) {
+  if (!classHasWeightRange(cls)) return "";
+  const { min, max } = classBounds(cls);
+  if (min > max) return `Rentang berat ${cls.name} tidak valid`;
+  const range = `${cls.name} (${classRangeText(cls)})`;
+  const text = String(raw ?? "").trim();
+  if (!text) return `Berat wajib diisi dalam rentang ${range}`;
+  const weight = Number(text);
+  if (!Number.isFinite(weight) || weight < min || weight > max) {
+    const shown = Number.isFinite(weight) ? formatKg(weight) : text;
+    return `Berat ${shown} kg di luar rentang ${range}`;
+  }
+  return "";
+}
+
+function genderForCategory(category, current) {
+  const g = category?.gender || "putra";
+  if (g === "putri") return "putri";
+  if (g === "putra") return "putra";
+  if (current === "putra" || current === "putri") return current;
+  return "putra";
+}
+
 export default function PublicRegister() {
   const { slug } = useParams();
   const location = useLocation();
@@ -96,22 +152,62 @@ export default function PublicRegister() {
     () => classes.filter((c) => !form.category_id || c.category_id === form.category_id),
     [classes, form.category_id]
   );
+  const selectedCategory = useMemo(
+    () => categories.find((c) => c.id === form.category_id) || null,
+    [categories, form.category_id]
+  );
+  const selectedClass = useMemo(
+    () => filteredClasses.find((c) => c.id === form.class_id) || null,
+    [filteredClasses, form.class_id]
+  );
+  const classRequired = !!selectedCategory && (selectedCategory.type || "tanding") === "tanding";
+  const genderLocked = !!selectedCategory && (selectedCategory.gender || "putra") !== "campuran";
+  const genderChoices = genderLocked
+    ? [selectedCategory.gender === "putri" ? "putri" : "putra"]
+    : ["putra", "putri"];
+  const bounds = classBounds(selectedClass);
+  const rangeActive = classHasWeightRange(selectedClass) && bounds.min <= bounds.max;
+  const weightMessage = weightPlacementMessage(selectedClass, form.weight);
 
-  const canSubmit =
-    form.event_id && form.name.trim().length >= 2 && form.gender && form.phone.trim().length >= 6 &&
+  useEffect(() => {
+    if (!selectedCategory) return;
+    const next = genderForCategory(selectedCategory, form.gender);
+    if (next === form.gender) return;
+    setForm((cur) => ({ ...cur, gender: next }));
+  }, [selectedCategory, form.gender]);
+
+  const canSubmit = Boolean(
+    form.event_id && form.category_id && form.name.trim().length >= 2 && form.gender && form.phone.trim().length >= 6 &&
     (form.contingent_id || form.contingent_name.trim()) &&
-    REQUIRED_DOCS.every((d) => files[d.key]);
+    REQUIRED_DOCS.every((d) => files[d.key]) &&
+    (!classRequired || form.class_id) &&
+    !weightMessage
+  );
 
   const submit = async () => {
+    if (selectedCategory && (selectedCategory.gender || "putra") !== "campuran" && form.gender !== (selectedCategory.gender || "putra")) {
+      toast.error("Gender peserta tidak sesuai dengan kategori");
+      return;
+    }
+    if (classRequired && !form.class_id) {
+      toast.error("Kelas wajib untuk kategori tanding");
+      return;
+    }
+    if (weightMessage) {
+      toast.error(weightMessage);
+      return;
+    }
     if (!canSubmit) {
       toast.error("Lengkapi semua field wajib dan unggah semua dokumen yang diminta");
       return;
     }
+    const rawWeight = String(form.weight ?? "").trim();
     setSubmitting(true);
     try {
       const payload = {
         ...form,
-        weight: Number(form.weight) || 0,
+        gender: genderForCategory(selectedCategory, form.gender),
+        weight: classHasWeightRange(selectedClass) ? Number(rawWeight) : (rawWeight === "" ? 0 : (Number(rawWeight) || 0)),
         photo_url: files.photo || form.photo_url,
       };
       const r = await PUB.post("/public/registrations", payload);
@@ -185,11 +281,20 @@ export default function PublicRegister() {
                   </SelectField>
                 )}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <SelectField label="Kategori" value={form.category_id} onChange={(v) => setForm({ ...form, category_id: v, class_id: "" })} testid="reg-category-select" disabled={!categories.length}>
+                  <SelectField
+                    label="Kategori *"
+                    value={form.category_id}
+                    onChange={(v) => {
+                      const category = categories.find((c) => c.id === v);
+                      setForm({ ...form, category_id: v, class_id: "", gender: genderForCategory(category, form.gender) });
+                    }}
+                    testid="reg-category-select"
+                    disabled={!categories.length}
+                  >
                     {categories.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
                   </SelectField>
-                  <SelectField label="Kelas (opsional)" value={form.class_id} onChange={(v) => setForm({ ...form, class_id: v })} testid="reg-class-select" disabled={!filteredClasses.length}>
-                    {filteredClasses.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
+                  <SelectField label={classRequired ? "Kelas *" : "Kelas (opsional)"} value={form.class_id} onChange={(v) => setForm({ ...form, class_id: v })} testid="reg-class-select" disabled={!filteredClasses.length}>
+                    {filteredClasses.map((c) => <SelectItem key={c.id} value={c.id}>{classOptionLabel(c)}</SelectItem>)}
                   </SelectField>
                 </div>
                 <SelectField label="Kontingen (terdaftar)" value={form.contingent_id} onChange={(v) => setForm({ ...form, contingent_id: v, contingent_name: "" })} testid="reg-contingent-select" disabled={!contingents.length}>
@@ -205,14 +310,26 @@ export default function PublicRegister() {
               <FormGroup title="Data Diri">
                 <FieldRow label="Nama Lengkap *"><Input value={form.name} maxLength={120} onChange={(e) => setForm({ ...form, name: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-name"/></FieldRow>
                 <div className="grid grid-cols-2 gap-4">
-                  <SelectField label="Jenis Kelamin *" value={form.gender} onChange={(v) => setForm({ ...form, gender: v })} testid="reg-gender">
-                    <SelectItem value="putra">Putra</SelectItem>
-                    <SelectItem value="putri">Putri</SelectItem>
+                  <SelectField label="Jenis Kelamin *" value={form.gender} onChange={(v) => setForm({ ...form, gender: v })} testid="reg-gender" disabled={genderLocked}>
+                    {genderChoices.map((g) => <SelectItem key={g} value={g}>{GENDER_LABEL[g]}</SelectItem>)}
                   </SelectField>
                   <FieldRow label="Tanggal Lahir"><Input type="date" value={form.dob} onChange={(e) => setForm({ ...form, dob: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-dob"/></FieldRow>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
-                  <FieldRow label="Berat (kg)"><Input type="number" value={form.weight} onChange={(e) => setForm({ ...form, weight: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-weight"/></FieldRow>
+                  <FieldRow label={rangeActive ? `Berat (${classRangeText(selectedClass)}) *` : "Berat (kg)"}>
+                    <Input
+                      type="number"
+                      inputMode="decimal"
+                      step="any"
+                      min={rangeActive ? bounds.min : undefined}
+                      max={rangeActive ? bounds.max : undefined}
+                      value={form.weight}
+                      onChange={(e) => setForm({ ...form, weight: e.target.value })}
+                      className="bg-[#0a0a0a] border-white/10"
+                      data-testid="reg-weight"
+                    />
+                    {weightMessage && <p className="text-[11px] text-red-400 mt-1" data-testid="reg-weight-error">{weightMessage}</p>}
+                  </FieldRow>
                   <FieldRow label="No. WhatsApp *"><Input value={form.phone} maxLength={32} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="08xxxxxxxxxx" className="bg-[#0a0a0a] border-white/10" data-testid="reg-phone"/></FieldRow>
                 </div>
                 <FieldRow label="Email (opsional)"><Input type="email" maxLength={254} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="bg-[#0a0a0a] border-white/10" data-testid="reg-email"/></FieldRow>

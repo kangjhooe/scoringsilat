@@ -932,6 +932,7 @@ function ClassesTab({ eventId }) {
           { key: "name", label: "Nama" },
           { key: "category_id", label: "Kategori", render: (i) => catName(i.category_id) },
           { key: "weight", label: "Berat", render: (i) => `${i.weight_min || 0} - ${i.weight_max || 0} kg` },
+          { key: "quota", label: "Kuota", render: (i) => (Number(i.quota) > 0 ? i.quota : "Tidak dibatasi") },
         ]}
         headerAction={<Button size="sm" onClick={openAdd} data-testid="add-class-btn" className="bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm"><Plus className="w-4 h-4 mr-1"/>Tambah</Button>}
         onEdit={openEdit}
