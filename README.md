@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="frontend/public/assets/silat-event-hero.png" alt="Silat Scoring" width="600"/>
+  <img src="frontend/public/assets/silat-event-hero2.jpeg" alt="Silat Scoring" width="600"/>
 </p>
 
 <h1 align="center">Silat Scoring</h1>
@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <strong>SMK ISNU</strong>
+  <strong>IPSI</strong>
 </p>
 
 ---
