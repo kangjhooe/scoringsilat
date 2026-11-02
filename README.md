@@ -169,6 +169,4 @@ Saat pertama kali backend jalan tanpa database, user berikut dibuat otomatis:
 - `GET /public/events` — Public event list
 - `GET /public/events/{slug}` — Public event detail
 
-## Lisensi
 
-Hak cipta milik **SMK ISNU**.

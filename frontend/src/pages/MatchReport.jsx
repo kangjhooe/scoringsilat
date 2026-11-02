@@ -123,8 +123,8 @@ export default function MatchReport() {
               <tr><th className="p-2 text-left">Ronde</th><th className="p-2 text-right">Sudut Merah</th><th className="p-2 text-right">Sudut Biru</th></tr>
             </thead>
             <tbody>
-              {[1,2,3].map((r) => {
-                const pr = state.per_round?.[r] || { red: 0, blue: 0 };
+              {Object.keys(state.per_round || { 1: {}, 2: {}, 3: {} }).map(Number).filter((n) => !Number.isNaN(n)).sort((a, b) => a - b).map((r) => {
+                const pr = state.per_round?.[r] || state.per_round?.[String(r)] || { red: 0, blue: 0 };
                 return <tr key={r} className="border-t border-zinc-200"><td className="p-2">{r}</td><td className="p-2 text-right">{pr.red}</td><td className="p-2 text-right">{pr.blue}</td></tr>;
               })}
               <tr className="border-t-2 border-black font-bold"><td className="p-2">Total</td><td className="p-2 text-right">{state.red.score}</td><td className="p-2 text-right">{state.blue.score}</td></tr>

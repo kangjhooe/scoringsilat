@@ -49,7 +49,7 @@ export default function SeniScoring() {
 
   const match = summary.match;
   const role = user?.role;
-  const isJury = role === "jury";
+  const canScore = role === "jury" || role === "head_jury" || role === "admin";
   const isHead = role === "head_jury" || role === "admin";
   const finalized = match.status === "approved";
 
@@ -59,9 +59,9 @@ export default function SeniScoring() {
       <PerformerHeader match={match} summary={summary} />
 
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2">
-          {isJury && !finalized && <JuryPanel mid={mid} summary={summary} user={user} onChanged={load} />}
-          {!isJury && <JuryScoreList summary={summary} />}
+        <div className="lg:col-span-2 space-y-4">
+          {canScore && !finalized && <JuryPanel mid={mid} summary={summary} user={user} onChanged={load} />}
+          <JuryScoreList summary={summary} />
         </div>
 
         <aside className="space-y-4">
@@ -80,10 +80,9 @@ export default function SeniScoring() {
 }
 
 function PerformerHeader({ match, summary }) {
-  const [athlete, setAthlete] = useState(null);
-  useEffect(() => {
-    if (match.red_athlete_id) api.get(`/athletes/${match.red_athlete_id}`).then((r) => setAthlete(r.data)).catch(() => {});
-  }, [match.red_athlete_id]);
+  const athletes = summary.athletes || [];
+  const athlete = athletes[0];
+  const names = athletes.map((a) => a.name).filter(Boolean).join(" · ") || "—";
   return (
     <div className="border border-white/10 rounded-sm bg-[#0f0f10] p-5 flex items-center gap-5" data-testid="seni-header">
       <div className="w-24 h-24 rounded-sm bg-[#0a0a0a] border border-white/10 overflow-hidden shrink-0 grid place-items-center">
@@ -91,7 +90,7 @@ function PerformerHeader({ match, summary }) {
       </div>
       <div className="flex-1 min-w-0">
         <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00]">Seni {match.discipline?.toUpperCase()}</div>
-        <div className="font-display text-3xl tracking-tight mt-1 truncate">{athlete?.name || "—"}</div>
+        <div className="font-display text-3xl tracking-tight mt-1 truncate">{names}</div>
         <div className="text-xs text-zinc-400 mt-1">Match #{match.match_number} · {match.round_label}</div>
       </div>
       <div className="text-right">
@@ -139,9 +138,9 @@ function JuryPanel({ mid, summary, user, onChanged }) {
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <RangeField label="Posisi Juri" min={1} max={9} step={1} value={form.jury_position} onChange={(v) => setForm({ ...form, jury_position: v })} testid="seni-position"/>
-        <RangeField label="Teknik (50–60)" min={0} max={60} step={1} value={form.teknik} onChange={(v) => setForm({ ...form, teknik: v })} accent testid="seni-teknik"/>
-        <RangeField label="Wirama (25–30)" min={0} max={30} step={1} value={form.wirama} onChange={(v) => setForm({ ...form, wirama: v })} accent testid="seni-wirama"/>
-        <RangeField label="Penghayatan (15–20)" min={0} max={20} step={1} value={form.penghayatan} onChange={(v) => setForm({ ...form, penghayatan: v })} accent testid="seni-penghayatan"/>
+        <RangeField label="Teknik (50–60)" min={50} max={60} step={1} value={form.teknik} onChange={(v) => setForm({ ...form, teknik: v })} accent testid="seni-teknik"/>
+        <RangeField label="Wirama (25–30)" min={25} max={30} step={1} value={form.wirama} onChange={(v) => setForm({ ...form, wirama: v })} accent testid="seni-wirama"/>
+        <RangeField label="Penghayatan (15–20)" min={15} max={20} step={1} value={form.penghayatan} onChange={(v) => setForm({ ...form, penghayatan: v })} accent testid="seni-penghayatan"/>
       </div>
 
       <div className="flex items-center justify-between border-t border-white/10 pt-4">
@@ -225,6 +224,7 @@ function ScoreSummary({ summary }) {
       <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400">Ringkasan</div>
       <div className="mt-3 space-y-2 text-sm">
         <Row label="Rata-rata" value={summary.average.toFixed(2)} />
+        {summary.dropped_high_low && <div className="text-[10px] text-zinc-500">Nilai tertinggi dan terendah tidak dihitung.</div>}
         <Row label="Hukuman" value={`− ${summary.total_penalty.toFixed(2)}`} accent="rose" />
         <div className="border-t border-white/10 pt-2 flex items-center justify-between">
           <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00]">Nilai Akhir</div>

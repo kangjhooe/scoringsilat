@@ -1,0 +1,176 @@
+{
+  "events": [
+    {
+      "name": "Iwa Tuhuk Cup 2026",
+      "code": "ITC26",
+      "location": "Krui",
+      "start_date": "2026-11-01",
+      "end_date": "2026-11-30",
+      "logo_url": "/api/uploads/f22655a1-1b0b-4883-a3cd-27158059a37d.jpeg",
+      "status": "active",
+      "slug": "itc26",
+      "landing_enabled": true,
+      "registration_enabled": true,
+      "landing_title": "Iwa Tuhuk Cup 2026",
+      "landing_subtitle": "Pendaftaran peserta pencak silat",
+      "landing_description": "Ikuti informasi event, kategori pertandingan, dan pendaftaran peserta melalui halaman resmi ini.",
+      "landing_poster_url": "/api/uploads/720e89cc-ec0d-4f1f-a21d-bd4b438edf4c.jpeg",
+      "landing_contact": "",
+      "landing_requirements": "",
+      "landing_schedule_note": "",
+      "id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "created_at": "2026-11-01T15:01:26.299989+00:00"
+    },
+    {
+      "name": "ABCD Cup",
+      "code": "ABCD",
+      "location": "Labuhan Jukung",
+      "start_date": "2026-12-01",
+      "end_date": "2026-12-26",
+      "logo_url": "",
+      "status": "active",
+      "slug": "abcd",
+      "landing_enabled": true,
+      "registration_enabled": true,
+      "landing_title": "ABCD Cup",
+      "landing_subtitle": "Pendaftaran peserta pencak silat",
+      "landing_description": "Ikuti informasi event, kategori pertandingan, dan pendaftaran peserta melalui halaman resmi ini.",
+      "landing_poster_url": "",
+      "landing_contact": "",
+      "landing_requirements": "",
+      "landing_schedule_note": "",
+      "id": "c657c69c-de9e-4984-8eb5-b583652f66c9",
+      "created_at": "2026-11-01T15:28:18.959856+00:00"
+    }
+  ],
+  "categories": [
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "name": "Kelas A",
+      "type": "tanding",
+      "gender": "putra",
+      "age_group": "Dewasa",
+      "quota": 100,
+      "id": "3e3e276f-c139-4c0e-b778-0f9df04a4f1f",
+      "created_at": "2026-11-01T15:08:19.609511+00:00"
+    },
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "name": "Kelas B",
+      "type": "tanding",
+      "gender": "putri",
+      "age_group": "Dewasa",
+      "quota": 50,
+      "id": "668562b8-644f-48af-a65a-c01f8ab8f25f",
+      "created_at": "2026-11-01T15:08:32.685110+00:00"
+    }
+  ],
+  "classes": [
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "category_id": "3e3e276f-c139-4c0e-b778-0f9df04a4f1f",
+      "name": "PutrA]a",
+      "weight_min": 40.0,
+      "weight_max": 60.0,
+      "quota": 0,
+      "id": "bbf7568c-2bd2-44fb-a992-51621b548254",
+      "created_at": "2026-11-01T15:09:10.210558+00:00"
+    },
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "category_id": "668562b8-644f-48af-a65a-c01f8ab8f25f",
+      "name": "Putri",
+      "weight_min": 40.0,
+      "weight_max": 60.0,
+      "quota": 0,
+      "id": "70c1778b-053a-47a8-a219-ac915f108306",
+      "created_at": "2026-11-01T15:09:22.706138+00:00"
+    }
+  ],
+  "contingents": [],
+  "arenas": [
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "name": "Gel 1",
+      "id": "7cbf7240-1566-406e-8c26-a9d8ffbb6e8f",
+      "created_at": "2026-11-01T15:09:31.522712+00:00"
+    },
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "name": "Gelanggang 2",
+      "id": "ea8ea981-ea8f-43a0-a3bf-062531df20e2",
+      "created_at": "2026-11-01T15:09:39.107016+00:00"
+    }
+  ],
+  "athletes": [],
+  "scoring_rules": [
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "name": "Aturan Standar IPSI",
+      "category_type": "tanding",
+      "round_count": 3,
+      "round_duration_sec": 120,
+      "rest_duration_sec": 60,
+      "points": {
+        "pukulan": 1,
+        "tendangan": 2,
+        "jatuhan": 3
+      },
+      "penalty_points": {
+        "teguran_1": 1,
+        "teguran_2": 2,
+        "peringatan_1": 5,
+        "peringatan_2": 10,
+        "peringatan_3": 0
+      },
+      "binaan_limit": 2,
+      "is_default": true,
+      "id": "4afe640d-49d3-4704-b642-2929a1b8c3e6",
+      "created_at": "2026-11-01T15:01:26.317149+00:00"
+    },
+    {
+      "event_id": "c657c69c-de9e-4984-8eb5-b583652f66c9",
+      "name": "Aturan Standar IPSI",
+      "category_type": "tanding",
+      "round_count": 3,
+      "round_duration_sec": 120,
+      "rest_duration_sec": 60,
+      "points": {
+        "pukulan": 1,
+        "tendangan": 2,
+        "jatuhan": 3
+      },
+      "penalty_points": {
+        "teguran_1": 1,
+        "teguran_2": 2,
+        "peringatan_1": 5,
+        "peringatan_2": 10,
+        "peringatan_3": 0
+      },
+      "binaan_limit": 2,
+      "is_default": true,
+      "id": "7f245942-8b86-46f2-88ab-17fbe0877603",
+      "created_at": "2026-11-01T15:28:18.967940+00:00"
+    }
+  ],
+  "matches": [],
+  "brackets": [
+    {
+      "event_id": "b7c51a03-ef8e-4f22-8d3c-3c6bf1f99ea8",
+      "class_id": "bbf7568c-2bd2-44fb-a992-51621b548254",
+      "category_id": null,
+      "name": "Bagan Pertandingan",
+      "discipline": "tanding",
+      "arena_id": "7cbf7240-1566-406e-8c26-a9d8ffbb6e8f",
+      "scoring_rule_id": "4afe640d-49d3-4704-b642-2929a1b8c3e6",
+      "size": 8,
+      "auto_fill": true,
+      "id": "aff95400-b53e-4b0e-9903-5ddb2f21f8c3",
+      "status": "running",
+      "created_at": "2026-11-01T15:16:10.625306+00:00",
+      "winner_athlete_id": null,
+      "finished_at": null,
+      "started_at": "2026-11-01T15:16:36.392784+00:00"
+    }
+  ]
+}

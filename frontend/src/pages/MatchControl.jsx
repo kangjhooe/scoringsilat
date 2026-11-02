@@ -136,7 +136,7 @@ function MatchHeader({ state, red, blue }) {
     <div className="border border-white/10 rounded-sm bg-[#141414] overflow-hidden">
       <div className="grid grid-cols-12 gap-0">
         {/* Red */}
-        <div className="col-span-12 md:col-span-4 bg-corner-red-solid p-6 relative">
+        <div className="col-span-12 md:col-span-4 bg-corner-red-solid p-4 md:p-6 relative">
           <div className="text-[10px] tracking-[0.3em] uppercase text-white/80 mb-2">Sudut Merah</div>
           <div className="flex items-center gap-4">
             <AthleteAvatar athlete={red} corner="red" size={72} />
@@ -145,23 +145,23 @@ function MatchHeader({ state, red, blue }) {
               <div className="text-white/70 text-sm">{red?.weight ? `${red.weight} kg · ` : ""}{red?.gender || ""}</div>
             </div>
           </div>
-          <div className="font-display text-7xl md:text-8xl tracking-tighter mt-4 leading-none" data-testid="header-red-score">{state.red.score}</div>
+          <div className="font-display text-6xl md:text-7xl xl:text-8xl tracking-tighter mt-4 leading-none" data-testid="header-red-score">{state.red.score}</div>
         </div>
 
         {/* Center */}
-        <div className="col-span-12 md:col-span-4 bg-[#0a0a0a] p-6 flex flex-col items-center justify-center border-x border-white/10">
+        <div className="col-span-12 md:col-span-4 bg-[#0a0a0a] p-4 md:p-6 flex flex-col items-center justify-center border-y md:border-y-0 md:border-x border-white/10">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-500">Ronde</div>
           <div className="font-display text-5xl tracking-tighter mt-1" data-testid="header-round">
             {state.current_round} <span className="text-zinc-600 text-3xl">/ {totalRounds}</span>
           </div>
-          <div className={`font-mono-display text-6xl mt-3 tracking-tighter ${state.timer?.running ? "text-[#ffcc00]" : "text-white"}`} data-testid="header-timer">
+          <div className={`font-mono-display text-5xl md:text-6xl mt-3 tracking-tighter ${state.timer?.running ? "text-[#ffcc00]" : "text-white"}`} data-testid="header-timer">
             {fmtTime(remaining)}
           </div>
           <div className="mt-2"><StatusBadge status={state.status}/></div>
         </div>
 
         {/* Blue */}
-        <div className="col-span-12 md:col-span-4 bg-corner-blue-solid p-6">
+        <div className="col-span-12 md:col-span-4 bg-corner-blue-solid p-4 md:p-6">
           <div className="text-[10px] tracking-[0.3em] uppercase text-white/80 mb-2 text-right">Sudut Biru</div>
           <div className="flex items-center gap-4 flex-row-reverse">
             <AthleteAvatar athlete={blue} corner="blue" size={72} />
@@ -170,10 +170,10 @@ function MatchHeader({ state, red, blue }) {
               <div className="text-white/70 text-sm">{blue?.weight ? `${blue.weight} kg · ` : ""}{blue?.gender || ""}</div>
             </div>
           </div>
-          <div className="font-display text-7xl md:text-8xl tracking-tighter mt-4 leading-none text-right" data-testid="header-blue-score">{state.blue.score}</div>
+          <div className="font-display text-6xl md:text-7xl xl:text-8xl tracking-tighter mt-4 leading-none text-right" data-testid="header-blue-score">{state.blue.score}</div>
         </div>
       </div>
-      <div className="px-6 py-3 bg-[#0a0a0a] border-t border-white/10 flex flex-wrap items-center gap-4 text-xs text-zinc-400">
+      <div className="px-4 md:px-6 py-3 bg-[#0a0a0a] border-t border-white/10 flex flex-wrap items-center gap-3 text-xs text-zinc-400">
         <div>Partai <span className="text-white font-mono-display">#{state.match_number}</span></div>
         <div className="text-zinc-600">·</div>
         <div>{state.round_label}</div>
@@ -211,7 +211,9 @@ function JuryPanel({ state, role, refresh, red, blue }) {
 
   const sendScore = async (corner, code, pts) => {
     try {
-      await api.post(`/matches/${state.id}/actions`, { corner, action_type: "score", code, points: pts });
+      const r = await api.post(`/matches/${state.id}/actions`, { corner, action_type: "score", code, points: pts });
+      if (r.data?.pending) toast("Menunggu juri lain");
+      else toast.success("Poin masuk");
     } catch (e) { toast.error(formatApiError(e)); }
   };
 
@@ -220,11 +222,20 @@ function JuryPanel({ state, role, refresh, red, blue }) {
   }
 
   const buttons = Object.entries(points);
+  const pending = state.pending_votes || [];
 
   return (
-    <div className="grid grid-cols-2 gap-4 md:gap-6">
+    <div className="space-y-4">
+      <div className="text-xs text-zinc-400">Poin masuk setelah dua juri menekan aksi yang sama dalam 2 detik.</div>
+      {pending.length > 0 && (
+        <div className="border border-[#ffcc00]/40 bg-[#ffcc00]/10 rounded-sm px-4 py-3 text-sm text-[#ffcc00]">
+          Menunggu juri lain: {pending.map((v) => `${v.code} sudut ${v.corner === "red" ? "merah" : "biru"}`).join(", ")}
+        </div>
+      )}
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-6">
       <CornerJury corner="red" athlete={red} score={state.red.score} buttons={buttons} disabled={!canScore} onScore={(code, pts) => sendScore("red", code, pts)} />
       <CornerJury corner="blue" athlete={blue} score={state.blue.score} buttons={buttons} disabled={!canScore} onScore={(code, pts) => sendScore("blue", code, pts)} />
+    </div>
     </div>
   );
 }
@@ -249,7 +260,7 @@ function CornerJury({ corner, athlete, score, buttons, disabled, onScore }) {
             disabled={disabled}
             onClick={() => onScore(code, pts)}
             data-testid={`jury-${corner}-${code}`}
-            className={`tap-press h-24 rounded-sm font-display text-3xl tracking-tight uppercase flex items-center justify-between px-6 transition-colors ${disabled ? "bg-zinc-800 text-zinc-600 cursor-not-allowed" : isRed ? "bg-[#ff3b30] hover:bg-[#ff5147] text-white" : "bg-[#007aff] hover:bg-[#1f8cff] text-white"}`}
+            className={`tap-press h-20 sm:h-24 rounded-sm font-display text-2xl sm:text-3xl tracking-tight uppercase flex items-center justify-between px-4 sm:px-6 gap-3 transition-colors ${disabled ? "bg-zinc-800 text-zinc-600 cursor-not-allowed" : isRed ? "bg-[#ff3b30] hover:bg-[#ff5147] text-white" : "bg-[#007aff] hover:bg-[#1f8cff] text-white"}`}
           >
             <span className="flex items-center gap-4">
               <ActionIcon code={code} className="w-10 h-10" />
@@ -295,7 +306,7 @@ function RefereePanel({ state, role, refresh }) {
   if (!can) return <NoticeBox text="Hanya Wasit atau Ketua Juri yang dapat memberi tindakan dari panel ini." />;
 
   return (
-    <div className="grid grid-cols-2 gap-4 md:gap-6">
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
       {["red", "blue"].map((c) => {
         const isRed = c === "red";
         return (
@@ -349,20 +360,20 @@ function TimerPanel({ state, role, refresh }) {
     <div className="grid grid-cols-12 gap-6">
       <div className="col-span-12 md:col-span-6 border border-white/10 rounded-sm bg-[#141414] p-8 text-center">
         <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400">Sisa Waktu Ronde</div>
-        <div className={`font-mono-display text-8xl md:text-9xl tracking-tighter mt-2 ${running ? "text-[#ffcc00]" : "text-white"}`} data-testid="timer-remaining">{fmtTime(remaining)}</div>
+        <div className={`font-mono-display text-7xl md:text-8xl xl:text-9xl tracking-tighter mt-2 ${running ? "text-[#ffcc00]" : "text-white"}`} data-testid="timer-remaining">{fmtTime(remaining)}</div>
         <div className="text-sm text-zinc-500 mt-2">Ronde {state.current_round} / {state.rule?.round_count || 3}</div>
       </div>
       <div className="col-span-12 md:col-span-6 grid grid-cols-2 gap-3">
-        <Button onClick={() => send("start")} data-testid="timer-start" className="tap-press h-24 rounded-sm bg-[#10b981] hover:bg-[#0ea271] text-white font-bold uppercase tracking-[0.15em]">
+        <Button onClick={() => send("start")} data-testid="timer-start" className="tap-press h-20 sm:h-24 rounded-sm bg-[#10b981] hover:bg-[#0ea271] text-white font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
           <Play className="w-5 h-5 mr-2"/> Mulai
         </Button>
-        <Button onClick={() => send("pause")} data-testid="timer-pause" className="tap-press h-24 rounded-sm bg-[#ffcc00] hover:bg-[#e6b800] text-black font-bold uppercase tracking-[0.15em]">
+        <Button onClick={() => send("pause")} data-testid="timer-pause" className="tap-press h-20 sm:h-24 rounded-sm bg-[#ffcc00] hover:bg-[#e6b800] text-black font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
           <Pause className="w-5 h-5 mr-2"/> Jeda
         </Button>
-        <Button onClick={() => send("reset")} data-testid="timer-reset" className="tap-press h-24 rounded-sm bg-zinc-700 hover:bg-zinc-600 text-white font-bold uppercase tracking-[0.15em]">
+        <Button onClick={() => send("reset")} data-testid="timer-reset" className="tap-press h-20 sm:h-24 rounded-sm bg-zinc-700 hover:bg-zinc-600 text-white font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
           <RotateCcw className="w-5 h-5 mr-2"/> Reset Ronde
         </Button>
-        <Button onClick={() => send("next_round")} data-testid="timer-next" className="tap-press h-24 rounded-sm bg-zinc-700 hover:bg-zinc-600 text-white font-bold uppercase tracking-[0.15em]">
+        <Button onClick={() => send("next_round")} data-testid="timer-next" className="tap-press h-20 sm:h-24 rounded-sm bg-zinc-700 hover:bg-zinc-600 text-white font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2">
           <SkipForward className="w-5 h-5 mr-2"/> Ronde Berikutnya
         </Button>
         <Button onClick={() => send("end_match")} data-testid="timer-end" className="tap-press col-span-2 h-16 rounded-sm bg-[#ff3b30] hover:bg-[#ff5147] text-white font-bold uppercase tracking-[0.15em]">
@@ -382,10 +393,15 @@ function HeadJuryPanel({ state, role, refresh, red, blue }) {
   const [notes, setNotes] = useState("");
 
   useEffect(() => {
+    if (state.winner_corner === "red" || state.winner_corner === "blue" || state.winner_corner === "draw") {
+      setWinner(state.winner_corner);
+      if (state.decision_method) setMethod(state.decision_method);
+      return;
+    }
     if (state.red.score > state.blue.score) setWinner("red");
     else if (state.blue.score > state.red.score) setWinner("blue");
     else setWinner("draw");
-  }, [state.red.score, state.blue.score]);
+  }, [state.red.score, state.blue.score, state.winner_corner, state.decision_method]);
 
   const approve = async () => {
     try {

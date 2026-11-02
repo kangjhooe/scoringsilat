@@ -11,6 +11,7 @@ import {
   Clock,
   LogIn,
   MapPin,
+  Menu,
   Monitor,
   Phone,
   ShieldCheck,
@@ -258,21 +259,22 @@ function EventLanding({ slug, eventSeed }) {
 }
 
 function PublicNav({ event }) {
+  const [open, setOpen] = useState(false);
   return (
     <header className="fixed inset-x-0 top-0 z-40 border-b border-white/10 bg-black/65 backdrop-blur">
-      <div className="mx-auto flex h-16 max-w-6xl items-center gap-4 px-6">
-        <Link to="/" className="flex items-center gap-3">
-          <div className="grid h-9 w-9 place-items-center bg-[#ffcc00] text-xl font-black text-black">S</div>
-          <div>
+      <div className="mx-auto flex h-16 max-w-6xl items-center gap-3 px-4 sm:px-6">
+        <Link to="/" className="flex min-w-0 items-center gap-3">
+          <div className="grid h-9 w-9 shrink-0 place-items-center bg-[#ffcc00] text-xl font-black text-black">S</div>
+          <div className="min-w-0">
             <div className="text-sm font-bold uppercase leading-none">Silat Scoring</div>
-            <div className="mt-1 text-[10px] uppercase text-zinc-500">{event?.name || "Event Publik"}</div>
+            <div className="mt-1 truncate text-[10px] uppercase text-zinc-500">{event?.name || "Event Publik"}</div>
           </div>
         </Link>
-        <nav className="ml-auto flex items-center gap-2">
+        <nav className="ml-auto hidden items-center gap-4 sm:flex">
           {event?.slug && (
             <>
-              <Link to={`/event/${event.slug}/register`} className="hidden text-xs uppercase text-zinc-300 hover:text-[#ffcc00] sm:inline">Daftar</Link>
-              <Link to={`/event/${event.slug}/check`} className="hidden text-xs uppercase text-zinc-300 hover:text-[#ffcc00] sm:inline">Cek Status</Link>
+              <Link to={`/event/${event.slug}/register`} className="text-xs uppercase text-zinc-300 hover:text-[#ffcc00]">Daftar</Link>
+              <Link to={`/event/${event.slug}/check`} className="text-xs uppercase text-zinc-300 hover:text-[#ffcc00]">Cek Status</Link>
             </>
           )}
           <Link to="/login" className="inline-flex items-center gap-2 border border-white/10 px-3 py-2 text-xs uppercase text-zinc-300 hover:border-[#ffcc00] hover:text-[#ffcc00]">
@@ -280,7 +282,30 @@ function PublicNav({ event }) {
             Login
           </Link>
         </nav>
+        <div className="ml-auto flex items-center gap-2 sm:hidden">
+          <Link to="/login" className="inline-flex items-center gap-2 border border-white/10 px-3 py-2 text-xs uppercase text-zinc-300 hover:border-[#ffcc00] hover:text-[#ffcc00]">
+            <LogIn className="h-3.5 w-3.5" />
+            Login
+          </Link>
+          {event?.slug && (
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-label="Buka menu"
+              onClick={() => setOpen((v) => !v)}
+              className="grid h-9 w-9 place-items-center border border-white/10 text-zinc-300"
+            >
+              <Menu className="h-4 w-4" />
+            </button>
+          )}
+        </div>
       </div>
+      {open && event?.slug && (
+        <div className="border-t border-white/10 bg-black/95 px-4 py-2 sm:hidden">
+          <Link to={`/event/${event.slug}/register`} onClick={() => setOpen(false)} className="block py-3 text-sm uppercase text-zinc-200 hover:text-[#ffcc00]">Daftar</Link>
+          <Link to={`/event/${event.slug}/check`} onClick={() => setOpen(false)} className="block py-3 text-sm uppercase text-zinc-200 hover:text-[#ffcc00]">Cek Status</Link>
+        </div>
+      )}
     </header>
   );
 }

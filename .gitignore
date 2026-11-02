@@ -68,6 +68,9 @@ releases/
 agenthub/agents/youtube/db
 backend/uploads/*
 !backend/uploads/.gitkeep
+!backend/uploads/f22655a1-1b0b-4883-a3cd-27158059a37d.jpeg
+!backend/uploads/720e89cc-ec0d-4f1f-a21d-bd4b438edf4c.jpeg
+!backend/uploads/b7965ea3-c07c-424e-8898-fa183dcbcf02.png
 test_reports/
 
 # Archive files and large assets

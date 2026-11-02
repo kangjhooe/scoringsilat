@@ -8,14 +8,12 @@
   --bg: #0a0a0a;
   --surface: #141414;
   --surface-2: #1c1c1f;
-  --border: #27272a;
   --text: #ffffff;
   --text-2: #a1a1aa;
   --red-base: #dc2626;
   --red-bright: #ff3b30;
   --blue-base: #2563eb;
   --blue-bright: #007aff;
-  --accent: #ffcc00;
   --success: #10b981;
 }
 
@@ -75,6 +73,20 @@ html, body, #root {
 /* Selection */
 ::selection { background: #ffcc00; color: #000; }
 
+/* Date fields sit on a near-black background. The native calendar glyph is black
+   unless the control is told to use a dark color scheme. */
+input[type="date"],
+input[type="datetime-local"],
+input[type="time"] {
+  color-scheme: dark;
+}
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.9;
+}
+
 /* Tap button press effect */
 .tap-press {
   transition: transform 120ms ease-out, background-color 120ms ease-out;
@@ -120,4 +132,26 @@ html, body, #root {
               radial-gradient(800px 400px at 0% 100%, rgba(220,38,38,0.12), transparent 60%),
               radial-gradient(800px 400px at 100% 100%, rgba(37,99,235,0.12), transparent 60%),
               #050505;
+}
+
+.display-avatar {
+  width: clamp(3.5rem, 12vh, 8.75rem);
+  height: clamp(3.5rem, 12vh, 8.75rem);
+}
+.display-name {
+  font-size: clamp(1.35rem, 4.2vh, 3.75rem);
+}
+.display-score {
+  font-size: clamp(3.5rem, 26vh, 18rem);
+  line-height: 0.82;
+}
+.display-round,
+.display-timer {
+  font-size: clamp(1.75rem, min(7vh, 6vw), 6rem);
+  line-height: 0.9;
+}
+@media (max-width: 767px) {
+  .display-score { font-size: clamp(4.5rem, 28vw, 8rem); }
+  .display-name { font-size: clamp(1.5rem, 8vw, 2.5rem); }
+  .display-avatar { width: 4.5rem; height: 4.5rem; }
 }

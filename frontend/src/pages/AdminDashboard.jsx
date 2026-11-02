@@ -10,8 +10,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { toast, Toaster } from "sonner";
-import { Plus, Trash2, Pencil, Calendar, MapPin, Users, Trophy, Building2, Settings2, ListChecks, Globe2, Eye, Link as LinkIcon } from "lucide-react";
+import { Plus, Trash2, Pencil, Calendar, MapPin, Users, Trophy, Building2, Settings2, ListChecks, Globe2, Eye, Link as LinkIcon, MoreVertical, Search } from "lucide-react";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import PhotoUpload, { resolvePhotoUrl } from "@/components/PhotoUpload";
 
 export default function AdminDashboard() {
@@ -19,6 +21,7 @@ export default function AdminDashboard() {
   const [events, setEvents] = useState([]);
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [editRequest, setEditRequest] = useState(null);
 
   const loadEvents = async () => {
     setLoading(true);
@@ -42,17 +45,24 @@ export default function AdminDashboard() {
     <AppShell title="Master Data">
       <Toaster theme="dark" position="top-right" />
       <div className="grid grid-cols-12 gap-6">
-        <aside className="col-span-12 md:col-span-3">
+        <aside className="col-span-12 md:col-span-4 xl:col-span-3">
           <EventsSidebar
             events={events}
             selectedId={selectedEvent?.id}
             onSelect={setSelectedEvent}
             onChanged={loadEvents}
             loading={loading}
+            editRequest={editRequest}
           />
         </aside>
-        <div className="col-span-12 md:col-span-9">
-          {selectedEvent ? <EventDetail event={selectedEvent} onChanged={loadEvents} /> : <EmptyState title="Pilih atau buat event terlebih dahulu" />}
+        <div className="col-span-12 min-w-0 md:col-span-8 xl:col-span-9">
+          {selectedEvent ? (
+            <EventDetail
+              event={selectedEvent}
+              onChanged={loadEvents}
+              onEdit={(event) => setEditRequest({ event, token: Date.now() })}
+            />
+          ) : <EmptyState title="Pilih atau buat event terlebih dahulu" />}
         </div>
       </div>
     </AppShell>
@@ -120,14 +130,85 @@ function eventToForm(e = {}) {
   };
 }
 
-function EventsSidebar({ events, selectedId, onSelect, onChanged, loading }) {
+const EVENT_STATUS = {
+  active: { label: "Aktif", className: "bg-[#ffcc00]/15 text-[#ffcc00]" },
+  registration_open: { label: "Pendaftaran", className: "bg-emerald-500/15 text-emerald-300" },
+  scheduled: { label: "Terjadwal", className: "bg-sky-500/15 text-sky-300" },
+  closed: { label: "Ditutup", className: "bg-white/10 text-zinc-400" },
+};
+
+const ID_MONTHS = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+
+function parseIsoDate(iso) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+  if (!match) return null;
+  return { year: match[1], month: Number(match[2]), day: Number(match[3]) };
+}
+
+function formatEventRange(start, end) {
+  const a = parseIsoDate(start);
+  const b = parseIsoDate(end);
+  if (!a && !b) return "";
+  const one = (d) => `${d.day} ${ID_MONTHS[d.month - 1] || d.month} ${d.year}`;
+  if (a && b && (a.year !== b.year || a.month !== b.month || a.day !== b.day)) {
+    if (a.year === b.year && a.month === b.month) return `${a.day}–${b.day} ${ID_MONTHS[a.month - 1]} ${a.year}`;
+    if (a.year === b.year) return `${a.day} ${ID_MONTHS[a.month - 1]} – ${b.day} ${ID_MONTHS[b.month - 1]} ${a.year}`;
+    return `${one(a)} – ${one(b)}`;
+  }
+  return one(a || b);
+}
+
+function eventInitials(name) {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+}
+
+function eventPublicUrl(event) {
+  return event?.slug ? `${window.location.origin}/event/${event.slug}` : `${window.location.origin}/`;
+}
+
+function EventStatusPill({ status }) {
+  const meta = EVENT_STATUS[status] || { label: status || "Tanpa status", className: "bg-white/10 text-zinc-400" };
+  return (
+    <span className={`inline-flex items-center rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em] ${meta.className}`}>
+      {meta.label}
+    </span>
+  );
+}
+
+function EventMark({ event, size = "md" }) {
+  const src = resolvePhotoUrl(event?.logo_url);
+  const box = size === "lg" ? "h-12 w-12 text-sm" : "h-9 w-9 text-[11px]";
+  if (src) {
+    return <img src={src} alt="" className={`${box} shrink-0 rounded-sm bg-[#0a0a0a] object-cover`} />;
+  }
+  return (
+    <div className={`${box} grid shrink-0 place-items-center rounded-sm bg-[#ffcc00]/15 font-semibold text-[#ffcc00]`}>
+      {eventInitials(event?.name)}
+    </div>
+  );
+}
+
+function EventsSidebar({ events, selectedId, onSelect, onChanged, loading, editRequest }) {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(EMPTY_EVENT);
   const [busy, setBusy] = useState(false);
+  const [query, setQuery] = useState("");
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
 
   const openAdd = () => { setEditing(null); setForm(EMPTY_EVENT); setOpen(true); };
   const openEdit = (e) => { setEditing(e); setForm(eventToForm(e)); setOpen(true); };
+
+  useEffect(() => {
+    if (!editRequest?.event) return;
+    setEditing(editRequest.event);
+    setForm(eventToForm(editRequest.event));
+    setOpen(true);
+  }, [editRequest]);
 
   const save = async () => {
     setBusy(true);
@@ -145,20 +226,53 @@ function EventsSidebar({ events, selectedId, onSelect, onChanged, loading }) {
     finally { setBusy(false); }
   };
 
-  const del = async (id) => {
-    if (!window.confirm("Hapus event ini?")) return;
-    try { await api.delete(`/events/${id}`); toast.success("Event dihapus"); onChanged(); }
-    catch (e) { toast.error(formatApiError(e)); }
+  const askDelete = (event) => {
+    // Wait until the dropdown closes. A native confirm opened in the same
+    // click is auto-accepted by Chrome, so deletion must be a second click.
+    setTimeout(() => setPendingDelete(event), 0);
   };
 
+  const del = async () => {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    try {
+      await api.delete(`/events/${pendingDelete.id}`);
+      toast.success("Event dihapus");
+      setPendingDelete(null);
+      onChanged();
+    } catch (e) { toast.error(formatApiError(e)); }
+    finally { setDeleting(false); }
+  };
+
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? events.filter((e) => [e.name, e.code, e.location].some((v) => String(v || "").toLowerCase().includes(q)))
+    : events;
+  const showSearch = events.length > 5 || query.length > 0;
+
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="text-xs tracking-[0.3em] uppercase text-zinc-400">Event</div>
-        <Button size="sm" onClick={openAdd} className="h-8 bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm" data-testid="create-event-btn">
-          <Plus className="w-4 h-4" />
+    <div className="md:sticky md:top-36 md:flex md:max-h-[calc(100vh-10rem)] md:flex-col md:gap-3 space-y-3 md:space-y-0">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-baseline gap-2">
+          <div className="text-sm font-semibold text-white">Event</div>
+          <div className="text-xs tabular-nums text-zinc-500">{events.length}</div>
+        </div>
+        <Button size="sm" onClick={openAdd} className="h-8 shrink-0 rounded-sm bg-[#ffcc00] px-2.5 text-xs text-black hover:bg-[#e6b800]" data-testid="create-event-btn">
+          <Plus className="w-3.5 h-3.5" /> Event baru
         </Button>
       </div>
+      {showSearch && (
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Cari nama, kode, lokasi"
+            className="h-9 border-white/10 bg-[#141414] pl-8 text-sm"
+            data-testid="event-search-input"
+          />
+        </div>
+      )}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="bg-[#141414] border-white/10 text-white max-w-md">
           <DialogHeader><DialogTitle className="font-display text-2xl uppercase tracking-tight">{editing ? "Edit Event" : "Event Baru"}</DialogTitle></DialogHeader>
@@ -189,44 +303,121 @@ function EventsSidebar({ events, selectedId, onSelect, onChanged, loading }) {
         </DialogContent>
       </Dialog>
 
+      <AlertDialog open={!!pendingDelete} onOpenChange={(next) => { if (!next && !deleting) setPendingDelete(null); }}>
+        <AlertDialogContent className="border-white/10 bg-[#141414] text-white">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Hapus event?</AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              Event <span className="font-medium text-white">{pendingDelete?.name}</span> akan dihapus dari daftar. Tindakan ini tidak bisa dibatalkan.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting} data-testid="delete-event-cancel" className="border-white/10 bg-transparent text-white hover:bg-white/10 hover:text-white">Batal</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(ev) => { ev.preventDefault(); del(); }}
+              data-testid="delete-event-confirm"
+              className="bg-[#ff3b30] text-white hover:bg-[#e0342b]"
+            >
+              {deleting ? "Menghapus..." : "Hapus event"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {loading ? (
         <div className="text-xs text-zinc-500">Memuat...</div>
       ) : events.length === 0 ? (
-        <div className="text-xs text-zinc-500 border border-dashed border-white/10 p-4 rounded-sm">Belum ada event</div>
+        <div className="rounded-sm border border-dashed border-white/10 p-4 text-xs text-zinc-500">Belum ada event</div>
+      ) : filtered.length === 0 ? (
+        <div className="rounded-sm border border-dashed border-white/10 p-4 text-xs text-zinc-500">Tidak ada event yang cocok</div>
       ) : (
-        <div className="space-y-2">
-          {events.map((e) => (
-            <div key={e.id} className={`group p-3 border rounded-sm transition-all ${selectedId === e.id ? "border-[#ffcc00] bg-[#ffcc00]/5" : "border-white/10 bg-[#141414] hover:border-white/30"}`}>
-              <button onClick={() => onSelect(e)} className="w-full text-left tap-press" data-testid={`event-card-${e.id}`}>
-                <div className="text-sm font-semibold text-white truncate pr-12">{e.name}</div>
-                <div className="flex items-center gap-2 text-[10px] text-zinc-500 mt-1"><MapPin className="w-3 h-3" /> {e.location || "-"}</div>
-                <div className="flex items-center gap-2 text-[10px] text-zinc-500 mt-1"><Calendar className="w-3 h-3" /> {e.start_date || "-"} → {e.end_date || "-"}</div>
-              </button>
-              <div className="flex items-center justify-end gap-1 mt-2">
-                <button onClick={() => openEdit(e)} className="p-1.5 text-zinc-400 hover:text-[#ffcc00] hover:bg-white/5 rounded-sm transition-colors" data-testid={`edit-event-${e.id}`}><Pencil className="w-3.5 h-3.5"/></button>
-                <button onClick={() => del(e.id)} className="p-1.5 text-zinc-500 hover:text-[#ff3b30] hover:bg-white/5 rounded-sm transition-colors" data-testid={`delete-event-${e.id}`}><Trash2 className="w-3.5 h-3.5"/></button>
+        <div className="space-y-2 md:min-h-0 md:overflow-y-auto md:pr-1">
+          {filtered.map((e) => {
+            const range = formatEventRange(e.start_date, e.end_date);
+            const selected = selectedId === e.id;
+            return (
+              <div key={e.id} className={`relative rounded-sm border transition-colors ${selected ? "border-[#ffcc00]/70 bg-[#ffcc00]/[0.06] shadow-[inset_3px_0_0_#ffcc00]" : "border-white/10 bg-[#141414] hover:border-white/25"}`}>
+                <button onClick={() => onSelect(e)} className="flex w-full gap-3 p-3 pr-10 text-left tap-press" data-testid={`event-card-${e.id}`}>
+                  <EventMark event={e} />
+                  <div className="min-w-0 flex-1">
+                    <div className="line-clamp-2 text-sm font-semibold leading-snug text-white">{e.name}</div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      <EventStatusPill status={e.status} />
+                      {e.code ? <span className="font-mono text-[11px] text-zinc-400">{e.code}</span> : null}
+                    </div>
+                    {range ? (
+                      <div className="mt-1.5 flex items-center gap-1.5 text-xs text-zinc-400">
+                        <Calendar className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{range}</span>
+                      </div>
+                    ) : null}
+                    {e.location ? (
+                      <div className="mt-1 flex items-center gap-1.5 text-xs text-zinc-500">
+                        <MapPin className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{e.location}</span>
+                      </div>
+                    ) : null}
+                  </div>
+                </button>
+                <div className="absolute right-1.5 top-2">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button className="rounded-sm p-1.5 text-zinc-500 transition-colors hover:bg-white/10 hover:text-white" aria-label={`Aksi ${e.name}`} data-testid={`event-menu-${e.id}`}>
+                        <MoreVertical className="h-4 w-4" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="min-w-[9rem] border-white/10 bg-[#141414] text-white">
+                      <DropdownMenuItem onClick={() => openEdit(e)} data-testid={`edit-event-${e.id}`} className="focus:bg-white/10 focus:text-white">
+                        <Pencil className="h-3.5 w-3.5" /> Edit
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => askDelete(e)} data-testid={`delete-event-${e.id}`} className="text-[#ff3b30] focus:bg-[#ff3b30]/10 focus:text-[#ff3b30]">
+                        <Trash2 className="h-3.5 w-3.5" /> Hapus
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
   );
 }
 
-function EventDetail({ event, onChanged }) {
+function EventDetail({ event, onChanged, onEdit }) {
+  const range = formatEventRange(event.start_date, event.end_date);
+  const publicUrl = eventPublicUrl(event);
   return (
     <div>
-      <div className="flex items-end justify-between mb-6">
-        <div>
-          <div className="text-[10px] tracking-[0.3em] uppercase text-[#ffcc00] mb-1">Event Aktif</div>
-          <h2 className="font-display text-3xl uppercase tracking-tight">{event.name}</h2>
-          <div className="text-sm text-zinc-400 mt-1">{event.location} · {event.start_date} → {event.end_date}</div>
+      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex min-w-0 gap-3">
+          <EventMark event={event} size="lg" />
+          <div className="min-w-0">
+            <div className="mb-1.5 flex flex-wrap items-center gap-2">
+              <EventStatusPill status={event.status} />
+              {event.code ? <span className="font-mono text-[11px] text-zinc-400">{event.code}</span> : null}
+            </div>
+            <h2 className="font-display text-3xl uppercase leading-none tracking-tight">{event.name}</h2>
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm text-zinc-400">
+              {event.location ? <span className="inline-flex items-center gap-1.5"><MapPin className="h-3.5 w-3.5" />{event.location}</span> : null}
+              {range ? <span className="inline-flex items-center gap-1.5"><Calendar className="h-3.5 w-3.5" />{range}</span> : null}
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          <Button onClick={() => onEdit(event)} data-testid="event-detail-edit-btn" className="rounded-sm border border-white/10 bg-white/5 text-white hover:bg-white/10">
+            <Pencil className="h-4 w-4" /> Edit event
+          </Button>
+          <Button asChild className="rounded-sm border border-white/10 bg-white/5 text-white hover:bg-white/10">
+            <a href={publicUrl} target="_blank" rel="noreferrer" data-testid="event-detail-landing-btn"><Eye className="h-4 w-4" /> Buka landing</a>
+          </Button>
         </div>
       </div>
 
       <Tabs defaultValue="rules" className="w-full">
-        <TabsList className="bg-[#141414] border border-white/10 rounded-sm h-auto p-1 flex-wrap">
+        <TabsList className="h-auto w-full max-w-full justify-start overflow-x-auto flex-nowrap rounded-sm border border-white/10 bg-[#141414] p-1 [&>*]:shrink-0">
           <TabsTrigger value="landing" data-testid="tab-landing" className="rounded-sm data-[state=active]:bg-[#ffcc00] data-[state=active]:text-black text-xs tracking-[0.15em] uppercase"><Globe2 className="w-3.5 h-3.5 mr-2" />Landing Page</TabsTrigger>
           <TabsTrigger value="rules" data-testid="tab-rules" className="rounded-sm data-[state=active]:bg-[#ffcc00] data-[state=active]:text-black text-xs tracking-[0.15em] uppercase"><Settings2 className="w-3.5 h-3.5 mr-2" />Aturan Skor</TabsTrigger>
           <TabsTrigger value="categories" data-testid="tab-categories" className="rounded-sm data-[state=active]:bg-[#ffcc00] data-[state=active]:text-black text-xs tracking-[0.15em] uppercase"><ListChecks className="w-3.5 h-3.5 mr-2" />Kategori</TabsTrigger>

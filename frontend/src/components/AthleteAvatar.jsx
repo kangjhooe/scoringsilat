@@ -40,14 +40,15 @@ export function initialsOf(name) {
  *   size:    pixel size (default 96)
  *   className: extra classes
  */
-export default function AthleteAvatar({ athlete, corner = "red", size = 96, className = "" }) {
+export default function AthleteAvatar({ athlete, corner = "red", size = 96, className = "", fluid = false }) {
   const isRed = corner === "red";
   const ring = isRed ? "ring-[#ff3b30]/60" : "ring-[#007aff]/60";
   const bgFallback = isRed ? "bg-[#7f1d1d]" : "bg-[#1e3a8a]";
   const photo = resolvePhotoUrl(athlete?.photo_url);
   const initials = initialsOf(athlete?.name);
 
-  const dims = { width: size, height: size };
+  const dims = fluid ? undefined : { width: size, height: size };
+  const initialStyle = fluid ? undefined : { fontSize: Math.max(14, Math.floor(size * 0.4)) };
 
   if (photo) {
     return (
@@ -70,9 +71,9 @@ export default function AthleteAvatar({ athlete, corner = "red", size = 96, clas
       className={`shrink-0 rounded-full overflow-hidden ring-4 ${ring} ${bgFallback} grid place-items-center text-white font-display tracking-tight ${className}`}
     >
       {initials.length > 0 ? (
-        <span style={{ fontSize: Math.max(14, Math.floor(size * 0.4)) }}>{initials}</span>
+        <span className={fluid ? "text-[clamp(1rem,3vh,2.5rem)] leading-none" : undefined} style={initialStyle}>{initials}</span>
       ) : (
-        <User style={{ width: size * 0.5, height: size * 0.5 }} />
+        <User className={fluid ? "w-[45%] h-[45%]" : undefined} style={fluid ? undefined : { width: size * 0.5, height: size * 0.5 }} />
       )}
     </div>
   );

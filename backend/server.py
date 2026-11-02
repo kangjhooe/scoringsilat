@@ -222,9 +222,9 @@ class BracketSlotAssignIn(BaseModel):
 # ============ Seni scoring models ============
 class SeniScoreIn(BaseModel):
     jury_position: int = Field(ge=1, le=9)
-    teknik: float = Field(ge=0, le=60)   # 50-60
-    wirama: float = Field(ge=0, le=30)   # 25-30
-    penghayatan: float = Field(ge=0, le=20)  # 15-20
+    teknik: float = Field(ge=50, le=60)
+    wirama: float = Field(ge=25, le=30)
+    penghayatan: float = Field(ge=15, le=20)
 
 class SeniPenaltyIn(BaseModel):
     code: str  # 'keluar_gelanggang' | 'waktu' | 'kostum' | 'lainnya'
@@ -347,32 +347,73 @@ class WSManager:
 manager = WSManager()
 
 # ============ Helpers: Match computation ============
+JURY_CONSENSUS_WINDOW_SEC = 2
+_consensus_locks: Dict[str, asyncio.Lock] = {}
+_expire_task: Optional[asyncio.Task] = None
+
+
+def _consensus_lock(match_id: str) -> asyncio.Lock:
+    lock = _consensus_locks.get(match_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _consensus_locks[match_id] = lock
+    return lock
+
+
+def _consume_timer(timer: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    timer = dict(timer or {})
+    if timer.get("running") and timer.get("started_at"):
+        started = datetime.fromisoformat(timer["started_at"])
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = (now - started).total_seconds()
+        timer["remaining_sec"] = max(0, float(timer.get("remaining_sec") or 0) - elapsed)
+        timer["running"] = False
+        timer["started_at"] = None
+    return timer
+
+
+def _ensure_round(per_round: Dict[int, Dict[str, int]], rnd: Any) -> int:
+    try:
+        rnd = int(rnd or 1)
+    except (TypeError, ValueError):
+        rnd = 1
+    if rnd < 1:
+        rnd = 1
+    if rnd not in per_round:
+        per_round[rnd] = {"red": 0, "blue": 0}
+    return rnd
+
+
 async def compute_match_state(match_id: str) -> Dict[str, Any]:
     match = await db.matches.find_one({"id": match_id}, {"_id": 0})
     if not match:
         return {}
     logs = await db.score_logs.find({"match_id": match_id, "valid": True}, {"_id": 0}).sort("timestamp", 1).to_list(5000)
     rule = await db.scoring_rules.find_one({"id": match.get("scoring_rule_id")}, {"_id": 0}) or {}
-    penalty_pts = rule.get("penalty_points", {})
 
     red = {"score": 0, "binaan": 0, "teguran": 0, "peringatan": 0}
     blue = {"score": 0, "binaan": 0, "teguran": 0, "peringatan": 0}
-    per_round = {1: {"red": 0, "blue": 0}, 2: {"red": 0, "blue": 0}, 3: {"red": 0, "blue": 0}}
+    round_count = max(1, int(rule.get("round_count") or 3))
+    per_round = {r: {"red": 0, "blue": 0} for r in range(1, round_count + 1)}
+    saved_winner = match.get("winner_corner")
+    saved_method = match.get("decision_method")
+    locked_result = match.get("status") in ("finished", "approved") and bool(saved_winner)
 
     for log in logs:
         c = log["corner"]
         target = red if c == "red" else blue
-        rnd = log.get("round", 1)
+        rnd = _ensure_round(per_round, log.get("round", 1))
         if log["action_type"] in ("score", "fall"):
             pts = int(log.get("points", 0))
             target["score"] += pts
-            if rnd in per_round:
-                per_round[rnd][c] += pts
+            per_round[rnd][c] += pts
         elif log["action_type"] == "penalty":
-            # opponent gains points
             opp = blue if c == "red" else red
+            opp_corner = "blue" if c == "red" else "red"
             pts = int(log.get("points", 0))
             opp["score"] += pts
+            per_round[rnd][opp_corner] += pts
             code = log.get("code", "")
             if code.startswith("teguran"):
                 target["teguran"] += 1
@@ -380,18 +421,87 @@ async def compute_match_state(match_id: str) -> Dict[str, Any]:
                 target["peringatan"] += 1
         elif log["action_type"] == "binaan":
             target["binaan"] += 1
-        elif log["action_type"] == "absolute_win":
-            # mark winner direct
+        elif log["action_type"] == "absolute_win" and not locked_result:
             match["winner_corner"] = c
             match["decision_method"] = "menang_mutlak"
 
-    # Augment match with computed fields
+    if locked_result:
+        match["winner_corner"] = saved_winner
+        match["decision_method"] = saved_method
+
+    window_start = (datetime.now(timezone.utc) - timedelta(seconds=JURY_CONSENSUS_WINDOW_SEC)).isoformat()
+    pending_votes = await db.score_votes.find(
+        {"match_id": match_id, "log_id": None, "timestamp": {"$gte": window_start}},
+        {"_id": 0},
+    ).to_list(50)
+
     out = dict(match)
     out["red"] = red
     out["blue"] = blue
     out["per_round"] = per_round
     out["rule"] = rule
+    out["pending_votes"] = pending_votes
     return out
+
+
+async def settle_expired_timer(match: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist a running timer that has reached 0 as paused. Returns the match to use afterwards."""
+    if not match or match.get("status") != "in_progress":
+        return match
+    timer = match.get("timer") or {}
+    if not timer.get("running") or not timer.get("started_at"):
+        return match
+    now = datetime.now(timezone.utc)
+    try:
+        started = datetime.fromisoformat(timer["started_at"])
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+    except Exception:
+        return match
+    remaining = float(timer.get("remaining_sec") or 0) - (now - started).total_seconds()
+    if remaining > 0:
+        return match
+    stopped = {"running": False, "remaining_sec": 0, "started_at": None, "round": timer.get("round", match.get("current_round", 1))}
+    await db.matches.update_one({"id": match["id"]}, {"$set": {"timer": stopped, "status": "paused"}})
+    updated = dict(match)
+    updated["timer"] = stopped
+    updated["status"] = "paused"
+    return updated
+
+
+async def _expire_running_matches_loop():
+    while True:
+        try:
+            matches = await db.matches.find({"status": "in_progress", "timer.running": True}).to_list(200)
+            for match in matches:
+                updated = await settle_expired_timer(match)
+                if updated.get("status") != match.get("status"):
+                    await broadcast_match_update(match["id"], "timer_update")
+        except Exception as e:
+            logger.warning("timer expire loop: %s", e)
+        await asyncio.sleep(1)
+
+
+async def _load_match_settled(mid: str) -> Optional[Dict[str, Any]]:
+    match = await db.matches.find_one({"id": mid})
+    if not match:
+        return None
+    updated = await settle_expired_timer(match)
+    if updated.get("status") != match.get("status"):
+        await broadcast_match_update(mid, "timer_update")
+    return updated
+
+
+async def _finish_match_decision(match: Dict[str, Any], winner_corner: str, decision_method: str) -> None:
+    now = datetime.now(timezone.utc)
+    timer = _consume_timer(match.get("timer") or {}, now)
+    await db.matches.update_one({"id": match["id"]}, {"$set": {
+        "status": "finished",
+        "winner_corner": winner_corner,
+        "decision_method": decision_method,
+        "finished_at": now.isoformat(),
+        "timer": timer,
+    }})
 
 async def broadcast_match_update(match_id: str, event_type: str = "update"):
     state = await compute_match_state(match_id)
@@ -580,7 +690,7 @@ async def create_event(data: EventIn, user=Depends(require_roles("admin"))):
 
 @api.get("/events")
 async def list_events(user=Depends(get_current_user)):
-    events = await list_collection(db.events)
+    events = await db.events.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
     return [normalize_public_event(e) for e in events]
 
 @api.get("/events/{eid}")
@@ -603,6 +713,30 @@ async def update_event(eid: str, data: EventIn, user=Depends(require_roles("admi
 
 @api.delete("/events/{eid}")
 async def delete_event(eid: str, user=Depends(require_roles("admin"))):
+    matches = await db.matches.find({"event_id": eid}, {"id": 1}).to_list(5000)
+    match_ids = [m["id"] for m in matches]
+    brackets = await db.brackets.find({"event_id": eid}, {"id": 1}).to_list(500)
+    bracket_ids = [b["id"] for b in brackets]
+    regs = await db.registrations.find({"event_id": eid}, {"id": 1}).to_list(10000)
+    reg_ids = [r["id"] for r in regs]
+    if match_ids:
+        await db.score_logs.delete_many({"match_id": {"$in": match_ids}})
+        await db.score_votes.delete_many({"match_id": {"$in": match_ids}})
+        await db.seni_scores.delete_many({"match_id": {"$in": match_ids}})
+        await db.seni_penalties.delete_many({"match_id": {"$in": match_ids}})
+    if bracket_ids:
+        await db.bracket_slots.delete_many({"bracket_id": {"$in": bracket_ids}})
+    if reg_ids:
+        await db.registration_files.delete_many({"registration_id": {"$in": reg_ids}})
+    await db.matches.delete_many({"event_id": eid})
+    await db.brackets.delete_many({"event_id": eid})
+    await db.registrations.delete_many({"event_id": eid})
+    await db.categories.delete_many({"event_id": eid})
+    await db.classes.delete_many({"event_id": eid})
+    await db.arenas.delete_many({"event_id": eid})
+    await db.contingents.delete_many({"event_id": eid})
+    await db.athletes.delete_many({"event_id": eid})
+    await db.scoring_rules.delete_many({"event_id": eid})
     await db.events.delete_one({"id": eid})
     return {"ok": True}
 
@@ -705,7 +839,12 @@ async def delete_athlete(aid: str, user=Depends(require_roles("admin"))):
 
 @api.put("/athletes/{aid}")
 async def update_athlete(aid: str, data: AthleteIn, user=Depends(require_roles("admin"))):
-    await db.athletes.update_one({"id": aid}, {"$set": data.model_dump()})
+    existing = await db.athletes.find_one({"id": aid}, {"_id": 1})
+    if not existing:
+        raise HTTPException(404, "Atlet tidak ditemukan")
+    updates = data.model_dump(exclude_unset=True)
+    if updates:
+        await db.athletes.update_one({"id": aid}, {"$set": updates})
     return await db.athletes.find_one({"id": aid}, {"_id": 0})
 
 # ============ Routes: Registrations (Phase 2) ============
@@ -808,23 +947,31 @@ async def delete_registration_file(rid: str, fid: str, user=Depends(require_role
     await db.registration_files.delete_one({"id": fid, "registration_id": rid})
     return {"ok": True}
 
+async def _assert_acceptance_quota(reg: Dict[str, Any], rid: str) -> None:
+    """Reject when the class or category quota for accepted participants is already full."""
+    occupied = {"event_id": reg["event_id"], "status": {"$in": ["accepted", "active_participant"]}, "id": {"$ne": rid}}
+    if reg.get("class_id"):
+        cls = await db.classes.find_one({"id": reg["class_id"]}, {"quota": 1})
+        quota = int((cls or {}).get("quota") or 0)
+        if quota > 0:
+            count = await db.registrations.count_documents({**occupied, "class_id": reg["class_id"]})
+            if count >= quota:
+                raise HTTPException(400, f"Kuota kelas penuh ({count}/{quota}). Jadikan cadangan atau tolak.")
+    if reg.get("category_id"):
+        cat = await db.categories.find_one({"id": reg["category_id"]}, {"quota": 1})
+        quota = int((cat or {}).get("quota") or 0)
+        if quota > 0:
+            count = await db.registrations.count_documents({**occupied, "category_id": reg["category_id"]})
+            if count >= quota:
+                raise HTTPException(400, f"Kuota kategori penuh ({count}/{quota}). Jadikan cadangan atau tolak.")
+
 @api.post("/registrations/{rid}/status")
 async def update_registration_status(rid: str, data: RegistrationUpdateStatusIn, user=Depends(require_roles("admin", "operator"))):
     reg = await db.registrations.find_one({"id": rid})
     if not reg:
         raise HTTPException(404, "Registrasi tidak ditemukan")
-    # Quota check on accepted: if class_id has a quota, count accepted+active_participant in that class
-    if data.status == "accepted" and reg.get("class_id"):
-        cls = await db.classes.find_one({"id": reg["class_id"]}, {"quota": 1})
-        quota = int((cls or {}).get("quota") or 0)
-        if quota > 0:
-            count = await db.registrations.count_documents({
-                "event_id": reg["event_id"], "class_id": reg["class_id"],
-                "status": {"$in": ["accepted", "active_participant"]},
-                "id": {"$ne": rid},
-            })
-            if count >= quota:
-                raise HTTPException(400, f"Kuota kelas penuh ({count}/{quota}). Jadikan cadangan atau tolak.")
+    if data.status == "accepted":
+        await _assert_acceptance_quota(reg, rid)
     history_entry = {"status": data.status, "at": now_iso(), "by": user["id"], "notes": data.admin_notes}
     update = {
         "$set": {"status": data.status, "admin_notes": data.admin_notes, "updated_at": now_iso()},
@@ -849,6 +996,8 @@ async def convert_to_athlete(rid: str, user=Depends(require_roles("admin", "oper
         raise HTTPException(404, "Registrasi tidak ditemukan")
     if reg.get("status") not in ("accepted", "reserve"):
         raise HTTPException(400, "Hanya registrasi dengan status diterima yang dapat dijadikan peserta aktif")
+    if reg.get("status") == "reserve":
+        await _assert_acceptance_quota(reg, rid)
     # Resolve or create contingent if only name given
     contingent_id = reg.get("contingent_id")
     if not contingent_id and reg.get("contingent_name"):
@@ -1184,6 +1333,7 @@ async def list_matches(event_id: Optional[str] = None, arena_id: Optional[str] =
 
 @api.get("/matches/{mid}")
 async def get_match(mid: str, user=Depends(get_current_user)):
+    await _load_match_settled(mid)
     state = await compute_match_state(mid)
     if not state:
         raise HTTPException(404, "Match tidak ditemukan")
@@ -1191,6 +1341,7 @@ async def get_match(mid: str, user=Depends(get_current_user)):
 
 @api.get("/public/matches/{mid}")
 async def public_get_match(mid: str):
+    await _load_match_settled(mid)
     state = await compute_match_state(mid)
     if not state:
         raise HTTPException(404, "Match tidak ditemukan")
@@ -1205,6 +1356,7 @@ async def public_arena_current(arena_id: str):
         m = await db.matches.find_one({"arena_id": arena_id, "status": "scheduled"}, {"_id": 0}, sort=[("match_number", 1)])
     if not m:
         return {"match": None}
+    await _load_match_settled(m["id"])
     state = await compute_match_state(m["id"])
     return {"match": state}
 
@@ -1212,7 +1364,115 @@ async def public_arena_current(arena_id: str):
 async def delete_match(mid: str, user=Depends(require_roles("admin", "operator"))):
     await db.matches.delete_one({"id": mid})
     await db.score_logs.delete_many({"match_id": mid})
+    await db.score_votes.delete_many({"match_id": mid})
     return {"ok": True}
+
+def _action_points(data: ScoreActionIn, rule: Dict[str, Any]) -> int:
+    points = data.points
+    if points == 0 and rule:
+        if data.action_type in ("score", "fall"):
+            points = int(rule.get("points", {}).get(data.code, 0))
+        elif data.action_type == "penalty":
+            points = int(rule.get("penalty_points", {}).get(data.code, 0))
+    return points
+
+async def _apply_jury_consensus(mid: str, match: Dict[str, Any], data: ScoreActionIn, user: Dict[str, Any], role: str, points: int) -> Dict[str, Any]:
+    """A score counts once when two different juries press the same action within the window."""
+    lock = _consensus_lock(mid)
+    async with lock:
+        now = datetime.now(timezone.utc)
+        window_start = (now - timedelta(seconds=JURY_CONSENSUS_WINDOW_SEC)).isoformat()
+        key = {
+            "match_id": mid,
+            "round": match.get("current_round", 1),
+            "corner": data.corner,
+            "code": data.code,
+        }
+        recent = await db.score_votes.find({**key, "timestamp": {"$gte": window_start}}, {"_id": 0}).to_list(20)
+        mine = next((v for v in recent if v.get("judge_id") == user["id"]), None)
+        if mine:
+            if mine.get("log_id"):
+                log = await db.score_logs.find_one({"id": mine["log_id"]}, {"_id": 0}) or {}
+                log["confirmed"] = True
+                log["pending"] = False
+                log["judges"] = len({v["judge_id"] for v in recent if v.get("log_id") == mine["log_id"]})
+                return log
+            return {
+                "pending": True, "confirmed": False,
+                "judges": len({v["judge_id"] for v in recent}),
+                "corner": data.corner, "code": data.code, "round": key["round"], "points": 0,
+            }
+
+        vote = {
+            "id": new_id(),
+            **key,
+            "judge_id": user["id"],
+            "judge_name": user.get("name", ""),
+            "timestamp": now.isoformat(),
+            "log_id": None,
+        }
+        await db.score_votes.insert_one(vote)
+        recent.append({k: v for k, v in vote.items() if k != "_id"})
+        unlinked = [v for v in recent if not v.get("log_id")]
+        linked_ids = [v["log_id"] for v in recent if v.get("log_id")]
+
+        async def attach(log_id: str) -> Dict[str, Any]:
+            ids = [v["id"] for v in unlinked]
+            if ids:
+                await db.score_votes.update_many({"id": {"$in": ids}}, {"$set": {"log_id": log_id}})
+            log = await db.score_logs.find_one({"id": log_id}, {"_id": 0}) or {}
+            log["confirmed"] = True
+            log["pending"] = False
+            log["judges"] = len({v["judge_id"] for v in recent})
+            await broadcast_match_update(mid, "score_update")
+            return log
+
+        if linked_ids and len({v["judge_id"] for v in unlinked}) < 2:
+            return await attach(linked_ids[-1])
+
+        if len({v["judge_id"] for v in unlinked}) < 2:
+            await broadcast_match_update(mid, "score_pending")
+            return {
+                "pending": True, "confirmed": False,
+                "judges": len({v["judge_id"] for v in unlinked}),
+                "corner": data.corner, "code": data.code, "round": key["round"], "points": 0,
+            }
+
+        if linked_ids:
+            return await attach(linked_ids[-1])
+
+        names = []
+        seen = set()
+        for v in unlinked:
+            if v["judge_id"] in seen:
+                continue
+            seen.add(v["judge_id"])
+            if v.get("judge_name"):
+                names.append(v["judge_name"])
+        log = {
+            "id": new_id(),
+            "match_id": mid,
+            "round": key["round"],
+            "corner": data.corner,
+            "action_type": "score",
+            "code": data.code,
+            "points": points,
+            "notes": data.notes,
+            "judge_id": user["id"],
+            "judge_name": ", ".join(names) or user.get("name", ""),
+            "judge_role": role,
+            "timestamp": now.isoformat(),
+            "valid": True,
+            "consensus": True,
+        }
+        await db.score_logs.insert_one(log)
+        await db.score_votes.update_many({"id": {"$in": [v["id"] for v in unlinked]}}, {"$set": {"log_id": log["id"]}})
+        await broadcast_match_update(mid, "score_update")
+        log.pop("_id", None)
+        log["confirmed"] = True
+        log["pending"] = False
+        log["judges"] = len(seen)
+        return log
 
 # ===== Score Actions =====
 @api.post("/matches/{mid}/actions")
@@ -1220,24 +1480,35 @@ async def add_action(mid: str, data: ScoreActionIn, user=Depends(require_roles("
     match = await db.matches.find_one({"id": mid})
     if not match:
         raise HTTPException(404, "Match tidak ditemukan")
+    match = await settle_expired_timer(match)
     if match["status"] not in ("in_progress", "paused"):
         raise HTTPException(400, "Match tidak sedang berjalan")
 
-    # Validate role/action combinations
     role = user["role"]
     if data.action_type == "score" and role not in ("jury", "admin"):
         raise HTTPException(403, "Hanya juri yang dapat memberi skor")
     if data.action_type in ("penalty", "fall", "binaan", "absolute_win") and role not in ("referee", "head_jury", "admin"):
         raise HTTPException(403, "Hanya wasit/ketua juri yang dapat memberi tindakan ini")
 
-    # Compute points from rule if not provided
-    rule = await db.scoring_rules.find_one({"id": match["scoring_rule_id"]})
-    points = data.points
-    if points == 0 and rule:
-        if data.action_type in ("score", "fall"):
-            points = int(rule.get("points", {}).get(data.code, 0))
-        elif data.action_type == "penalty":
-            points = int(rule.get("penalty_points", {}).get(data.code, 0))
+    timer = match.get("timer") or {}
+    clock_done = not timer.get("running") and float(timer.get("remaining_sec") or 0) <= 0
+    if data.action_type == "score" and clock_done:
+        raise HTTPException(400, "Waktu ronde habis. Mulai ronde lagi atau akhiri partai sebelum menambah skor.")
+
+    rule = await db.scoring_rules.find_one({"id": match["scoring_rule_id"]}) or {}
+    points = _action_points(data, rule)
+
+    if data.action_type == "binaan":
+        limit = int(rule.get("binaan_limit") or 0)
+        if limit > 0:
+            count = await db.score_logs.count_documents({
+                "match_id": mid, "corner": data.corner, "action_type": "binaan", "valid": True,
+            })
+            if count >= limit:
+                raise HTTPException(400, f"Batas binaan sudut ini sudah tercapai ({limit}). Gunakan teguran.")
+
+    if data.action_type == "score":
+        return await _apply_jury_consensus(mid, match, data, user, role, points)
 
     log = {
         "id": new_id(),
@@ -1255,6 +1526,11 @@ async def add_action(mid: str, data: ScoreActionIn, user=Depends(require_roles("
         "valid": True,
     }
     await db.score_logs.insert_one(log)
+    if data.action_type == "absolute_win":
+        await _finish_match_decision(match, data.corner, "menang_mutlak")
+    elif data.action_type == "penalty" and data.code == "peringatan_3":
+        opponent = "blue" if data.corner == "red" else "red"
+        await _finish_match_decision(match, opponent, "menang_diskualifikasi")
     await broadcast_match_update(mid, "score_update")
     log.pop("_id", None)
     return log
@@ -1276,6 +1552,9 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
     match = await db.matches.find_one({"id": mid})
     if not match:
         raise HTTPException(404, "Match tidak ditemukan")
+    if data.action in ("start", "resume") and match.get("status") in ("approved", "finished"):
+        raise HTTPException(400, "Partai yang sudah selesai atau disahkan tidak dapat dimulai lagi")
+    match = await settle_expired_timer(match)
     rule = await db.scoring_rules.find_one({"id": match["scoring_rule_id"]}) or {}
     round_duration = rule.get("round_duration_sec", 120)
     total_rounds = rule.get("round_count", 3)
@@ -1284,12 +1563,8 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
     now = datetime.now(timezone.utc)
 
     def consume_running():
-        if timer.get("running") and timer.get("started_at"):
-            started = datetime.fromisoformat(timer["started_at"])
-            elapsed = (now - started).total_seconds()
-            timer["remaining_sec"] = max(0, timer.get("remaining_sec", 0) - elapsed)
-            timer["running"] = False
-            timer["started_at"] = None
+        nonlocal timer
+        timer = _consume_timer(timer, now)
 
     update = {}
     if data.action == "start":
@@ -1338,6 +1613,9 @@ async def approve_match(mid: str, data: ApproveIn, user=Depends(require_roles("h
     match = await db.matches.find_one({"id": mid})
     if not match:
         raise HTTPException(404, "Match tidak ditemukan")
+    match = await settle_expired_timer(match)
+    if match.get("status") not in ("paused", "finished"):
+        raise HTTPException(400, "Partai hanya dapat disahkan saat dijeda atau selesai")
     state = await compute_match_state(mid)
     winner = data.winner_corner
     if not winner:
@@ -1459,44 +1737,49 @@ async def _create_match_for_slot(bracket: Dict[str, Any], slot: Dict[str, Any]) 
     return None  # not used; round-1 has its own loop, and advancement creates the next match inline
 
 async def _bracket_advance_winner(bracket_id: str, parent_slot_id: str, winner_athlete_id: str) -> None:
-    """Place winner_athlete_id into the parent slot. If sibling slot also has an athlete, create the next match."""
+    """Place the winner into the slot this match feeds. Create the next match only when both sources are ready, and point that match at the slot which receives ITS winner."""
     parent = await db.bracket_slots.find_one({"id": parent_slot_id, "bracket_id": bracket_id})
-    if not parent: return
-    await db.bracket_slots.update_one({"id": parent_slot_id}, {"$set": {"athlete_id": winner_athlete_id}})
+    if not parent:
+        return
+    await db.bracket_slots.update_one({"id": parent_slot_id}, {"$set": {"athlete_id": winner_athlete_id, "is_bye": False}})
     parent["athlete_id"] = winner_athlete_id
-    # Look for grandparent (next round) - this parent IS a source for the next-round slot
     next_slot = await db.bracket_slots.find_one({"bracket_id": bracket_id, "$or": [{"source_a": parent_slot_id}, {"source_b": parent_slot_id}]})
     if not next_slot:
-        # Final round winner — bracket complete
         await db.brackets.update_one({"id": bracket_id}, {"$set": {"status": "completed", "winner_athlete_id": winner_athlete_id, "finished_at": now_iso()}})
         return
-    # Check if the sibling source is also resolved
     sibling_id = next_slot["source_b"] if next_slot.get("source_a") == parent_slot_id else next_slot.get("source_a")
     sibling = await db.bracket_slots.find_one({"id": sibling_id}) if sibling_id else None
-    if sibling and sibling.get("athlete_id") and not next_slot.get("match_id"):
-        # Both sides resolved → create next match
-        bracket = await db.brackets.find_one({"id": bracket_id})
-        if not bracket: return
-        # Determine red vs blue from source_a / source_b
-        red_aid = (await db.bracket_slots.find_one({"id": next_slot["source_a"]}))["athlete_id"]
-        blue_aid = (await db.bracket_slots.find_one({"id": next_slot["source_b"]}))["athlete_id"]
-        if not (red_aid and blue_aid):
-            return
-        # Walkover (bye) — auto-advance without creating match
-        red_slot = await db.bracket_slots.find_one({"id": next_slot["source_a"]})
-        blue_slot = await db.bracket_slots.find_one({"id": next_slot["source_b"]})
-        if red_slot.get("is_bye"):
-            await _bracket_advance_winner(bracket_id, next_slot["id"], blue_aid); return
-        if blue_slot.get("is_bye"):
-            await _bracket_advance_winner(bracket_id, next_slot["id"], red_aid); return
-        await _create_bracket_match(bracket, next_slot, red_aid, blue_aid)
+    if sibling and sibling.get("is_bye") and not sibling.get("athlete_id"):
+        await _bracket_advance_winner(bracket_id, next_slot["id"], winner_athlete_id)
+        return
+    if not (sibling and sibling.get("athlete_id")):
+        return
+    existing = await db.matches.find_one({"bracket_id": bracket_id, "bracket_slot_id": next_slot["id"]})
+    if existing:
+        return
+    bracket = await db.brackets.find_one({"id": bracket_id})
+    if not bracket:
+        return
+    source_a = await db.bracket_slots.find_one({"id": next_slot["source_a"]})
+    source_b = await db.bracket_slots.find_one({"id": next_slot["source_b"]})
+    if not source_a or not source_b:
+        return
+    red_aid = source_a.get("athlete_id")
+    blue_aid = source_b.get("athlete_id")
+    if source_a.get("is_bye") and not red_aid and blue_aid:
+        await _bracket_advance_winner(bracket_id, next_slot["id"], blue_aid)
+        return
+    if source_b.get("is_bye") and not blue_aid and red_aid:
+        await _bracket_advance_winner(bracket_id, next_slot["id"], red_aid)
+        return
+    if not (red_aid and blue_aid):
+        return
+    await _create_bracket_match(bracket, next_slot, source_a, source_b, red_aid, blue_aid)
 
-async def _create_bracket_match(bracket: Dict[str, Any], slot: Dict[str, Any], red_aid: str, blue_aid: str) -> Optional[Dict[str, Any]]:
-    """Create a match record linked to a bracket slot and find its parent for advancement."""
+async def _create_bracket_match(bracket: Dict[str, Any], destination: Dict[str, Any], source_a: Dict[str, Any], source_b: Dict[str, Any], red_aid: str, blue_aid: str) -> Optional[Dict[str, Any]]:
+    """Create a match between two source slots. The winner is written into destination."""
     if not (bracket.get("arena_id") and bracket.get("scoring_rule_id")):
         return None
-    # Find parent (next round) for advancement
-    parent = await db.bracket_slots.find_one({"bracket_id": bracket["id"], "$or": [{"source_a": slot["id"]}, {"source_b": slot["id"]}]})
     seq = await next_seq(f"bracket_match:{bracket['id']}")
     match = {
         "id": new_id(),
@@ -1510,9 +1793,9 @@ async def _create_bracket_match(bracket: Dict[str, Any], slot: Dict[str, Any], r
         "discipline": bracket.get("discipline", "tanding"),
         "performer_ids": [],
         "match_number": seq,
-        "round_label": f"{bracket['name']} · R{slot['round']}",
+        "round_label": f"{bracket['name']} · R{source_a.get('round', 1)}",
         "bracket_id": bracket["id"],
-        "bracket_slot_id": parent["id"] if parent else None,
+        "bracket_slot_id": destination["id"],
         "status": "scheduled",
         "current_round": 1,
         "timer": {"running": False, "remaining_sec": 0, "started_at": None, "round": 1},
@@ -1526,7 +1809,8 @@ async def _create_bracket_match(bracket: Dict[str, Any], slot: Dict[str, Any], r
     if rule:
         match["timer"]["remaining_sec"] = rule.get("round_duration_sec", 120)
     await db.matches.insert_one(match)
-    await db.bracket_slots.update_one({"id": slot["id"]}, {"$set": {"match_id": match["id"]}})
+    await db.bracket_slots.update_one({"id": source_a["id"]}, {"$set": {"match_id": match["id"]}})
+    await db.bracket_slots.update_one({"id": source_b["id"]}, {"$set": {"match_id": match["id"]}})
     match.pop("_id", None)
     return match
 
@@ -1600,6 +1884,10 @@ async def start_bracket(bid: str, user=Depends(require_roles("admin", "operator"
         if not c: break
         # Find parent slot (round 2)
         parent = await db.bracket_slots.find_one({"bracket_id": bid, "round": 2, "$or": [{"source_a": a["id"]}, {"source_b": a["id"]}]})
+        if a.get("is_bye") and c.get("is_bye"):
+            if parent:
+                await db.bracket_slots.update_one({"id": parent["id"]}, {"$set": {"is_bye": True, "athlete_id": None}})
+            continue
         # If one side is bye → auto-advance the other to parent
         if a.get("is_bye") and c.get("athlete_id"):
             if parent: await _bracket_advance_winner(bid, parent["id"], c["athlete_id"])
@@ -1647,9 +1935,10 @@ async def delete_bracket(bid: str, user=Depends(require_roles("admin"))):
 async def _seni_summary(mid: str) -> Dict[str, Any]:
     scores = await db.seni_scores.find({"match_id": mid}, {"_id": 0}).sort("jury_position", 1).to_list(20)
     penalties = await db.seni_penalties.find({"match_id": mid}, {"_id": 0}).sort("added_at", 1).to_list(50)
-    avg = 0.0
-    if scores:
-        avg = sum(float(s.get("total") or 0) for s in scores) / len(scores)
+    totals = [float(s.get("total") or 0) for s in scores]
+    dropped_high_low = len(totals) >= 5
+    used = sorted(totals)[1:-1] if dropped_high_low else totals
+    avg = sum(used) / len(used) if used else 0.0
     total_penalty = sum(float(p.get("value") or 0) for p in penalties)
     final = max(0.0, round(avg - total_penalty, 2))
     return {
@@ -1659,23 +1948,40 @@ async def _seni_summary(mid: str) -> Dict[str, Any]:
         "average": round(avg, 2),
         "total_penalty": round(total_penalty, 2),
         "final_score": final,
+        "dropped_high_low": dropped_high_low,
     }
+
+async def _attach_match_athletes(summary: Dict[str, Any], match: Dict[str, Any]) -> Dict[str, Any]:
+    ids: List[str] = []
+    if match.get("red_athlete_id"):
+        ids.append(match["red_athlete_id"])
+    for pid in match.get("performer_ids") or []:
+        if pid and pid not in ids:
+            ids.append(pid)
+    if match.get("blue_athlete_id") and match["blue_athlete_id"] not in ids:
+        ids.append(match["blue_athlete_id"])
+    athletes = []
+    if ids:
+        found = await db.athletes.find({"id": {"$in": ids}}, {"_id": 0}).to_list(20)
+        by_id = {a["id"]: a for a in found}
+        athletes = [by_id[i] for i in ids if i in by_id]
+    summary["athletes"] = athletes
+    summary["match"] = match
+    return summary
 
 @api.get("/matches/{mid}/seni")
 async def get_seni(mid: str, user=Depends(get_current_user)):
     match = await db.matches.find_one({"id": mid}, {"_id": 0})
     if not match: raise HTTPException(404, "Match tidak ditemukan")
     summary = await _seni_summary(mid)
-    summary["match"] = match
-    return summary
+    return await _attach_match_athletes(summary, match)
 
 @api.get("/public/matches/{mid}/seni")
 async def public_get_seni(mid: str):
     match = await db.matches.find_one({"id": mid}, {"_id": 0})
     if not match: raise HTTPException(404, "Match tidak ditemukan")
     summary = await _seni_summary(mid)
-    summary["match"] = match
-    return summary
+    return await _attach_match_athletes(summary, match)
 
 @api.post("/matches/{mid}/seni/score")
 async def post_seni_score(mid: str, data: SeniScoreIn, user=Depends(require_roles("jury", "head_jury", "admin"))):
@@ -1769,6 +2075,7 @@ async def ws_arena(websocket: WebSocket, arena_id: str):
         # send initial state
         m = await db.matches.find_one({"arena_id": arena_id, "status": {"$in": ["in_progress", "paused"]}})
         if m:
+            await settle_expired_timer(m)
             state = await compute_match_state(m["id"])
             await websocket.send_text(json.dumps({"type": "initial", "match_id": m["id"], "state": state}, default=str))
         while True:
@@ -1783,6 +2090,7 @@ async def ws_match(websocket: WebSocket, match_id: str):
     room = f"match:{match_id}"
     await manager.connect(room, websocket)
     try:
+        await _load_match_settled(match_id)
         state = await compute_match_state(match_id)
         await websocket.send_text(json.dumps({"type": "initial", "match_id": match_id, "state": state}, default=str))
         while True:
@@ -1831,10 +2139,15 @@ async def startup():
     await db.bracket_slots.create_index([("bracket_id", 1), ("round", 1), ("position", 1)])
     await db.seni_scores.create_index([("match_id", 1), ("jury_id", 1)], unique=True)
     await db.seni_penalties.create_index([("match_id", 1)])
+    await db.score_votes.create_index([("match_id", 1), ("timestamp", 1)])
     await ensure_event_public_defaults()
     await seed_admin()
     await seed_demo_users()
     await seed_demo_event()
+    await seed_example_events()
+    global _expire_task
+    if _expire_task is None or _expire_task.done():
+        _expire_task = asyncio.create_task(_expire_running_matches_loop())
     logger.info("Startup complete: admin + demo seed done")
 
 async def ensure_event_public_defaults():
@@ -1898,6 +2211,48 @@ async def seed_demo_users():
                 "role": role,
                 "created_at": now_iso(),
             })
+
+EXAMPLE_EVENTS_PATH = ROOT_DIR / "seed" / "example_events.json"
+EXAMPLE_EVENT_COLLECTIONS = (
+    "categories",
+    "classes",
+    "contingents",
+    "arenas",
+    "athletes",
+    "scoring_rules",
+    "matches",
+    "brackets",
+)
+
+async def seed_example_events():
+    """Masukkan contoh event (beserta logo/poster) hanya jika belum ada."""
+    if not EXAMPLE_EVENTS_PATH.exists():
+        return
+    try:
+        data = json.loads(EXAMPLE_EVENTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Gagal membaca seed contoh event")
+        return
+    for event in data.get("events") or []:
+        event_id = event.get("id")
+        if not event_id:
+            continue
+        exists = await db.events.find_one({
+            "$or": [
+                {"id": event_id},
+                {"code": event.get("code")},
+                {"slug": event.get("slug")},
+            ]
+        })
+        if exists:
+            continue
+        await db.events.insert_one(dict(event))
+        for col in EXAMPLE_EVENT_COLLECTIONS:
+            for doc in data.get(col) or []:
+                if doc.get("event_id") != event_id or not doc.get("id"):
+                    continue
+                if not await db[col].find_one({"id": doc["id"]}):
+                    await db[col].insert_one(dict(doc))
 
 async def seed_demo_event():
     # Only seed once

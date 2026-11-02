@@ -195,19 +195,33 @@ def test_timer_start_and_state(tokens, created_match):
     assert g.json()["status"] == "in_progress"
 
 
+def _post_score(token, mid, corner, code):
+    return requests.post(f"{API}/matches/{mid}/actions", headers=H(token),
+                         json={"corner": corner, "action_type": "score", "code": code})
+
+
 def test_jury_scoring(tokens, created_match):
     mid = created_match["id"]
-    # red pukulan (=1)
-    r1 = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["juri1"]),
-                       json={"corner": "red", "action_type": "score", "code": "pukulan"})
+    # One jury is not enough.
+    r1 = _post_score(tokens["juri1"], mid, "red", "pukulan")
     assert r1.status_code == 200, r1.text
-    assert r1.json()["points"] == 1
-    # blue tendangan (=2)
-    r2 = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["juri2"]),
-                       json={"corner": "blue", "action_type": "score", "code": "tendangan"})
-    assert r2.status_code == 200
-    assert r2.json()["points"] == 2
-    # red jatuhan (=3) via fall action type
+    assert r1.json().get("pending") is True
+    assert requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()["red"]["score"] == 0
+    # Second jury confirms a single point.
+    r2 = _post_score(tokens["juri2"], mid, "red", "pukulan")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["points"] == 1
+    assert r2.json().get("confirmed") is True
+    # Same jury inside the window does not add another point.
+    again = _post_score(tokens["juri1"], mid, "red", "pukulan")
+    assert again.status_code == 200, again.text
+    assert requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()["red"]["score"] == 1
+    # Blue tendangan also needs two juries.
+    assert _post_score(tokens["juri1"], mid, "blue", "tendangan").status_code == 200
+    r_tendang = _post_score(tokens["juri2"], mid, "blue", "tendangan")
+    assert r_tendang.status_code == 200
+    assert r_tendang.json()["points"] == 2
+    # red jatuhan (=3) via fall action type, immediate
     r3 = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["wasit"]),
                        json={"corner": "red", "action_type": "fall", "code": "jatuhan"})
     assert r3.status_code == 200
@@ -216,6 +230,9 @@ def test_jury_scoring(tokens, created_match):
     g = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
     assert g["red"]["score"] == 4  # 1 + 3
     assert g["blue"]["score"] == 2
+    per = g["per_round"].get("1") or g["per_round"].get(1)
+    assert per["red"] == 4
+    assert per["blue"] == 2
 
 
 def test_role_based_access(tokens, created_match):
@@ -245,6 +262,9 @@ def test_referee_penalty(tokens, created_match):
     after = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
     assert after["blue"]["score"] == blue_before + 1
     assert after["red"]["teguran"] >= 1
+    before_round = before["per_round"].get("1") or before["per_round"].get(1)
+    after_round = after["per_round"].get("1") or after["per_round"].get(1)
+    assert after_round["blue"] == before_round["blue"] + 1
 
 
 def test_timer_pause_next_end(tokens, created_match):
@@ -275,6 +295,10 @@ def test_score_correction(tokens, created_match):
 
 def test_head_jury_approve(tokens, created_match):
     mid = created_match["id"]
+    state = requests.get(f"{API}/matches/{mid}", headers=H(tokens["admin"])).json()
+    if state["status"] not in ("paused", "finished"):
+        end = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "end_match"})
+        assert end.status_code == 200, end.text
     r = requests.post(f"{API}/matches/{mid}/approve", headers=H(tokens["ketuajuri"]),
                       json={"decision_method": "menang_angka"})
     assert r.status_code == 200, r.text
@@ -329,3 +353,209 @@ def test_websocket_arena(demo, tokens, created_match):
         return True
 
     assert asyncio.get_event_loop().run_until_complete(run())
+
+
+def _play_match(tokens, mid, winner="red"):
+    assert requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"}).status_code == 200
+    paused = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "pause"})
+    assert paused.status_code == 200, paused.text
+    approved = requests.post(
+        f"{API}/matches/{mid}/approve",
+        headers=H(tokens["ketuajuri"]),
+        json={"winner_corner": winner, "decision_method": "menang_angka"},
+    )
+    assert approved.status_code == 200, approved.text
+    return approved.json()
+
+
+def test_cannot_approve_scheduled_match(tokens, demo):
+    h = H(tokens["operator"])
+    created = requests.post(f"{API}/matches", headers=h, json={
+        "event_id": demo["event"]["id"],
+        "arena_id": demo["arenas"][0]["id"],
+        "scoring_rule_id": demo["rule"]["id"],
+        "red_athlete_id": demo["athletes"][0]["id"],
+        "blue_athlete_id": demo["athletes"][1]["id"],
+        "match_number": 1001,
+        "round_label": "TEST_SCHEDULED",
+    })
+    assert created.status_code == 200, created.text
+    mid = created.json()["id"]
+    try:
+        denied = requests.post(f"{API}/matches/{mid}/approve", headers=H(tokens["ketuajuri"]), json={"decision_method": "menang_angka"})
+        assert denied.status_code == 400
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_cannot_restart_approved_match(tokens, demo):
+    h = H(tokens["operator"])
+    created = requests.post(f"{API}/matches", headers=h, json={
+        "event_id": demo["event"]["id"],
+        "arena_id": demo["arenas"][0]["id"],
+        "scoring_rule_id": demo["rule"]["id"],
+        "red_athlete_id": demo["athletes"][0]["id"],
+        "blue_athlete_id": demo["athletes"][1]["id"],
+        "match_number": 1002,
+        "round_label": "TEST_RESTART",
+    })
+    assert created.status_code == 200, created.text
+    mid = created.json()["id"]
+    try:
+        _play_match(tokens, mid, "red")
+        restart = requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"})
+        assert restart.status_code == 400
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_athlete_update_keeps_participant_number(tokens, demo):
+    h = H(tokens["admin"])
+    contingents = requests.get(f"{API}/contingents?event_id={demo['event']['id']}", headers=h).json()
+    assert contingents, "demo contingent missing"
+    created = requests.post(f"{API}/athletes", headers=h, json={
+        "event_id": demo["event"]["id"],
+        "contingent_id": contingents[0]["id"],
+        "name": "Atlet Nomor",
+        "gender": "putra",
+    })
+    assert created.status_code == 200, created.text
+    body = created.json()
+    try:
+        updated = requests.put(f"{API}/athletes/{body['id']}", headers=h, json={
+            "event_id": demo["event"]["id"],
+            "contingent_id": contingents[0]["id"],
+            "name": "Atlet Nomor Diubah",
+            "gender": "putra",
+        })
+        assert updated.status_code == 200, updated.text
+        saved = updated.json()
+        assert saved["name"] == "Atlet Nomor Diubah"
+        assert saved["participant_number"] == body["participant_number"]
+        assert saved["participant_number"]
+    finally:
+        requests.delete(f"{API}/athletes/{body['id']}", headers=h)
+
+
+def test_seni_match_includes_athlete_and_rejects_low_score(tokens, demo):
+    h = H(tokens["operator"])
+    created = requests.post(f"{API}/matches", headers=h, json={
+        "event_id": demo["event"]["id"],
+        "arena_id": demo["arenas"][0]["id"],
+        "scoring_rule_id": demo["rule"]["id"],
+        "red_athlete_id": demo["athletes"][0]["id"],
+        "blue_athlete_id": "",
+        "performer_ids": [],
+        "discipline": "tunggal",
+        "match_number": 1003,
+        "round_label": "TEST_SENI",
+    })
+    assert created.status_code == 200, created.text
+    mid = created.json()["id"]
+    try:
+        seni = requests.get(f"{API}/matches/{mid}/seni", headers=H(tokens["admin"]))
+        assert seni.status_code == 200, seni.text
+        assert seni.json()["athletes"][0]["name"] == demo["athletes"][0]["name"]
+        bad = requests.post(f"{API}/matches/{mid}/seni/score", headers=H(tokens["juri1"]), json={
+            "jury_position": 1, "teknik": 10, "wirama": 28, "penghayatan": 18,
+        })
+        assert bad.status_code == 422
+        ok = requests.post(f"{API}/matches/{mid}/seni/score", headers=H(tokens["ketuajuri"]), json={
+            "jury_position": 1, "teknik": 55, "wirama": 28, "penghayatan": 18,
+        })
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["jury_count"] == 1
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_binaan_limit(tokens, demo):
+    h = H(tokens["operator"])
+    created = requests.post(f"{API}/matches", headers=h, json={
+        "event_id": demo["event"]["id"],
+        "arena_id": demo["arenas"][0]["id"],
+        "scoring_rule_id": demo["rule"]["id"],
+        "red_athlete_id": demo["athletes"][0]["id"],
+        "blue_athlete_id": demo["athletes"][1]["id"],
+        "match_number": 1004,
+        "round_label": "TEST_BINAAN",
+    })
+    assert created.status_code == 200, created.text
+    mid = created.json()["id"]
+    try:
+        assert requests.post(f"{API}/matches/{mid}/timer", headers=H(tokens["timer"]), json={"action": "start"}).status_code == 200
+        for _ in range(2):
+            ok = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["wasit"]), json={
+                "corner": "red", "action_type": "binaan", "code": "binaan_1",
+            })
+            assert ok.status_code == 200, ok.text
+        blocked = requests.post(f"{API}/matches/{mid}/actions", headers=H(tokens["wasit"]), json={
+            "corner": "red", "action_type": "binaan", "code": "binaan_1",
+        })
+        assert blocked.status_code == 400
+    finally:
+        requests.delete(f"{API}/matches/{mid}", headers=H(tokens["admin"]))
+
+
+def test_bracket_reaches_final_and_champion(tokens, demo):
+    h = H(tokens["admin"])
+    contingents = requests.get(f"{API}/contingents?event_id={demo['event']['id']}", headers=h).json()
+    assert contingents
+    athletes = []
+    for i in range(4):
+        created = requests.post(f"{API}/athletes", headers=h, json={
+            "event_id": demo["event"]["id"],
+            "contingent_id": contingents[0]["id"],
+            "name": f"Bracket Tes {i}",
+            "gender": "putra",
+        })
+        assert created.status_code == 200, created.text
+        athletes.append(created.json())
+    bracket_id = None
+    try:
+        created = requests.post(f"{API}/brackets", headers=h, json={
+            "event_id": demo["event"]["id"],
+            "name": "Tes Empat",
+            "size": 4,
+            "auto_fill": False,
+            "arena_id": demo["arenas"][0]["id"],
+            "scoring_rule_id": demo["rule"]["id"],
+            "discipline": "tanding",
+        })
+        assert created.status_code == 200, created.text
+        bracket = created.json()
+        bracket_id = bracket["id"]
+        round1 = sorted([s for s in bracket["slots"] if s["round"] == 1], key=lambda s: s["position"])
+        assert len(round1) == 4
+        for slot, athlete in zip(round1, athletes):
+            assigned = requests.put(
+                f"{API}/brackets/{bracket_id}/slots/{slot['id']}",
+                headers=h,
+                json={"athlete_id": athlete["id"]},
+            )
+            assert assigned.status_code == 200, assigned.text
+        started = requests.post(f"{API}/brackets/{bracket_id}/start", headers=h)
+        assert started.status_code == 200, started.text
+        semis = []
+        for slot in started.json()["slots"]:
+            if slot["round"] == 1 and slot.get("match_id") and slot["match_id"] not in semis:
+                semis.append(slot["match_id"])
+        assert len(semis) == 2
+        for mid in semis:
+            _play_match(tokens, mid, "red")
+        after = requests.get(f"{API}/brackets/{bracket_id}", headers=h).json()
+        assert after["status"] == "running"
+        finals = []
+        for slot in after["slots"]:
+            if slot["round"] == 2 and slot.get("match_id") and slot["match_id"] not in finals:
+                finals.append(slot["match_id"])
+        assert len(finals) == 1
+        final = requests.get(f"{API}/matches/{finals[0]}", headers=h).json()
+        assert final["bracket_slot_id"]
+        _play_match(tokens, finals[0], "red")
+        done = requests.get(f"{API}/brackets/{bracket_id}", headers=h).json()
+        assert done["status"] == "completed"
+        assert done["winner_athlete_id"] == final["red_athlete_id"]
+    finally:
+        for athlete in athletes:
+            requests.delete(f"{API}/athletes/{athlete['id']}", headers=h)

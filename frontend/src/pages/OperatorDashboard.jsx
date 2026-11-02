@@ -61,30 +61,30 @@ export default function OperatorDashboard() {
   return (
     <AppShell title="Manajemen Pertandingan">
       <Toaster theme="dark" position="top-right" />
-      <div className="flex flex-wrap items-center gap-3 mb-6">
-        <div>
+      <div className="flex flex-wrap items-end gap-3 mb-6">
+        <div className="w-full sm:w-auto">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mb-1">Event</div>
           <Select value={eventId} onValueChange={setEventId}>
-            <SelectTrigger className="w-72 bg-[#141414] border-white/10" data-testid="event-select"><SelectValue/></SelectTrigger>
+            <SelectTrigger className="w-full sm:w-72 bg-[#141414] border-white/10" data-testid="event-select"><SelectValue/></SelectTrigger>
             <SelectContent className="bg-[#141414] border-white/10 text-white">
               {events.map((e) => <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>)}
             </SelectContent>
           </Select>
         </div>
-        <div>
+        <div className="w-full sm:w-auto">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mb-1">Filter Gelanggang</div>
           <Select value={filterArena} onValueChange={setFilterArena}>
-            <SelectTrigger className="w-56 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
+            <SelectTrigger className="w-full sm:w-56 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
             <SelectContent className="bg-[#141414] border-white/10 text-white">
               <SelectItem value="all">Semua</SelectItem>
               {arenas.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
             </SelectContent>
           </Select>
         </div>
-        <div>
+        <div className="w-full sm:w-auto">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mb-1">Filter Status</div>
           <Select value={filterStatus} onValueChange={setFilterStatus}>
-            <SelectTrigger className="w-56 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
+            <SelectTrigger className="w-full sm:w-56 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
             <SelectContent className="bg-[#141414] border-white/10 text-white">
               <SelectItem value="all">Semua</SelectItem>
               <SelectItem value="scheduled">Terjadwal</SelectItem>
@@ -95,7 +95,7 @@ export default function OperatorDashboard() {
             </SelectContent>
           </Select>
         </div>
-        <div className="ml-auto">
+        <div className="w-full sm:w-auto sm:ml-auto">
           <MatchCreateDialog eventId={eventId} arenas={arenas} athletes={athletes} rules={rules} classes={classes} onCreated={loadAll} />
         </div>
       </div>
@@ -106,8 +106,8 @@ export default function OperatorDashboard() {
           <div className="text-sm tracking-[0.2em] uppercase">Belum ada partai. Buat partai baru.</div>
         </div>
       ) : (
-        <div className="border border-white/10 rounded-sm overflow-hidden">
-          <table className="w-full text-sm">
+        <div className="border border-white/10 rounded-sm overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
             <thead className="bg-[#141414] text-[10px] tracking-[0.2em] uppercase text-zinc-400">
               <tr>
                 <th className="text-left px-4 py-3 w-12">#</th>
@@ -163,27 +163,56 @@ function StatusBadge({ status }) {
   return <Badge className={`border ${m.c} text-[10px] tracking-[0.2em] uppercase rounded-sm`}>{m.label}</Badge>;
 }
 
+const DISCIPLINE_COUNT = { tanding: 2, tunggal: 1, ganda: 2, regu: 3 };
+
 function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreated }) {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({
     arena_id: "", class_id: "", scoring_rule_id: "",
     red_athlete_id: "", blue_athlete_id: "", match_number: 1, round_label: "Babak Penyisihan",
+    discipline: "tanding", performer_ids: ["", ""],
   });
   const [busy, setBusy] = useState(false);
+  const isTanding = form.discipline === "tanding";
+  const seniCount = DISCIPLINE_COUNT[form.discipline] || 1;
 
   useEffect(() => {
     if (open && arenas[0] && !form.arena_id) setForm((f) => ({ ...f, arena_id: arenas[0].id }));
     if (open && rules[0] && !form.scoring_rule_id) setForm((f) => ({ ...f, scoring_rule_id: rules[0].id }));
   }, [open, arenas, rules]);
 
+  const setPerformer = (index, id) => {
+    const next = [...form.performer_ids];
+    next[index] = id;
+    setForm({ ...form, performer_ids: next });
+  };
+
   const create = async () => {
-    if (!form.red_athlete_id || !form.blue_athlete_id || form.red_athlete_id === form.blue_athlete_id) {
-      toast.error("Pilih dua atlet yang berbeda");
-      return;
+    let payload;
+    if (isTanding) {
+      if (!form.red_athlete_id || !form.blue_athlete_id || form.red_athlete_id === form.blue_athlete_id) {
+        toast.error("Pilih dua atlet yang berbeda");
+        return;
+      }
+      payload = { ...form, event_id: eventId, discipline: "tanding", performer_ids: [] };
+    } else {
+      const ids = form.performer_ids.slice(0, seniCount).filter(Boolean);
+      if (ids.length !== seniCount || new Set(ids).size !== seniCount) {
+        toast.error(`Pilih ${seniCount} pesilat yang berbeda`);
+        return;
+      }
+      payload = {
+        ...form,
+        event_id: eventId,
+        discipline: form.discipline,
+        red_athlete_id: ids[0],
+        blue_athlete_id: "",
+        performer_ids: ids.slice(1),
+      };
     }
     setBusy(true);
     try {
-      await api.post("/matches", { ...form, event_id: eventId });
+      await api.post("/matches", payload);
       toast.success("Partai dibuat");
       setOpen(false);
       onCreated();
@@ -194,13 +223,13 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button data-testid="create-match-btn" disabled={!eventId} className="bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm tracking-[0.15em] uppercase">
+        <Button data-testid="create-match-btn" disabled={!eventId} className="w-full sm:w-auto bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm tracking-[0.15em] uppercase">
           <Plus className="w-4 h-4 mr-2" />Buat Partai
         </Button>
       </DialogTrigger>
-      <DialogContent className="bg-[#141414] border-white/10 text-white max-w-xl">
+      <DialogContent className="bg-[#141414] border-white/10 text-white max-w-xl max-h-[85vh] overflow-y-auto">
         <DialogHeader><DialogTitle className="font-display text-2xl uppercase">Partai Baru</DialogTitle></DialogHeader>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
             <Label className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">Gelanggang</Label>
             <Select value={form.arena_id} onValueChange={(v) => setForm({ ...form, arena_id: v })}>
@@ -223,23 +252,49 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
             </Select>
           </div>
           <div>
+            <Label className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">Disiplin</Label>
+            <Select value={form.discipline} onValueChange={(v) => setForm({ ...form, discipline: v, performer_ids: ["", "", ""] })}>
+              <SelectTrigger className="bg-[#0a0a0a] border-white/10 mt-1" data-testid="match-discipline-select"><SelectValue/></SelectTrigger>
+              <SelectContent className="bg-[#141414] border-white/10 text-white">
+                <SelectItem value="tanding">Tanding</SelectItem>
+                <SelectItem value="tunggal">Tunggal</SelectItem>
+                <SelectItem value="ganda">Ganda</SelectItem>
+                <SelectItem value="regu">Regu</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div>
             <Label className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">Babak / Label</Label>
             <Input value={form.round_label} onChange={(e) => setForm({ ...form, round_label: e.target.value })} className="bg-[#0a0a0a] border-white/10 mt-1" />
           </div>
-          <div>
-            <Label className="text-[10px] tracking-[0.2em] uppercase text-[#ff3b30]">Sudut Merah (Atlet)</Label>
-            <Select value={form.red_athlete_id} onValueChange={(v) => setForm({ ...form, red_athlete_id: v })}>
-              <SelectTrigger data-testid="match-red-athlete-select" className="bg-[#0a0a0a] border-white/10 mt-1"><SelectValue placeholder="Pilih atlet..."/></SelectTrigger>
-              <SelectContent className="bg-[#141414] border-white/10 text-white">{athletes.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}</SelectContent>
-            </Select>
-          </div>
-          <div>
-            <Label className="text-[10px] tracking-[0.2em] uppercase text-[#007aff]">Sudut Biru (Atlet)</Label>
-            <Select value={form.blue_athlete_id} onValueChange={(v) => setForm({ ...form, blue_athlete_id: v })}>
-              <SelectTrigger data-testid="match-blue-athlete-select" className="bg-[#0a0a0a] border-white/10 mt-1"><SelectValue placeholder="Pilih atlet..."/></SelectTrigger>
-              <SelectContent className="bg-[#141414] border-white/10 text-white">{athletes.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}</SelectContent>
-            </Select>
-          </div>
+          {isTanding ? (
+            <>
+              <div>
+                <Label className="text-[10px] tracking-[0.2em] uppercase text-[#ff3b30]">Sudut Merah (Atlet)</Label>
+                <Select value={form.red_athlete_id} onValueChange={(v) => setForm({ ...form, red_athlete_id: v })}>
+                  <SelectTrigger data-testid="match-red-athlete-select" className="bg-[#0a0a0a] border-white/10 mt-1"><SelectValue placeholder="Pilih atlet..."/></SelectTrigger>
+                  <SelectContent className="bg-[#141414] border-white/10 text-white">{athletes.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label className="text-[10px] tracking-[0.2em] uppercase text-[#007aff]">Sudut Biru (Atlet)</Label>
+                <Select value={form.blue_athlete_id} onValueChange={(v) => setForm({ ...form, blue_athlete_id: v })}>
+                  <SelectTrigger data-testid="match-blue-athlete-select" className="bg-[#0a0a0a] border-white/10 mt-1"><SelectValue placeholder="Pilih atlet..."/></SelectTrigger>
+                  <SelectContent className="bg-[#141414] border-white/10 text-white">{athletes.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+            </>
+          ) : (
+            Array.from({ length: seniCount }, (_, index) => (
+              <div key={index}>
+                <Label className="text-[10px] tracking-[0.2em] uppercase text-[#ffcc00]">Pesilat {index + 1}</Label>
+                <Select value={form.performer_ids[index] || ""} onValueChange={(v) => setPerformer(index, v)}>
+                  <SelectTrigger data-testid={`match-performer-${index}`} className="bg-[#0a0a0a] border-white/10 mt-1"><SelectValue placeholder="Pilih pesilat..."/></SelectTrigger>
+                  <SelectContent className="bg-[#141414] border-white/10 text-white">{athletes.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+            ))
+          )}
           <div>
             <Label className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">Nomor Partai</Label>
             <Input type="number" value={form.match_number} onChange={(e) => setForm({ ...form, match_number: Number(e.target.value) || 1 })} className="bg-[#0a0a0a] border-white/10 mt-1" />
