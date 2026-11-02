@@ -3494,8 +3494,7 @@ async def startup():
     await seed_admin()
     if env_flag("SEED_DEMO"):
         await seed_demo_users()
-        await seed_demo_event()
-        await seed_example_events()
+        # Akun demo saja. Event yang sudah dihapus tidak boleh dibuat ulang saat restart.
     global _expire_task
     if _expire_task is None or _expire_task.done():
         _expire_task = asyncio.create_task(_expire_running_matches_loop())
