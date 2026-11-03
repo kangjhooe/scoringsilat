@@ -93,7 +93,7 @@
 
 ```bash
 # Clone repo
-git clone https://github.com/syahrullanw/skoring-silat.git /opt/digital-silat-main
+git clone https://github.com/kangjhooe/scoringsilat.git /opt/digital-silat-main
 cd /opt/digital-silat-main
 
 # Install Docker (Ubuntu/Debian)

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
+import { useAuth } from "@/contexts/AuthContext";
 import api from "@/lib/api";
 import { openPublicMatchSocket, openArenaSocket } from "@/lib/ws";
 import { Tv, ArrowRight } from "lucide-react";
@@ -56,10 +57,19 @@ function computeRemaining(timer) {
 }
 
 // ============ Selector view ============
+function workspaceBack(user) {
+  if (user?.role === "admin") return { to: "/admin", label: "← Kembali ke master data" };
+  if (user?.role === "operator") return { to: "/operator", label: "← Kembali ke pertandingan" };
+  if (user) return { to: "/dashboard", label: "← Kembali ke dashboard" };
+  return { to: "/login", label: "← Kembali ke login" };
+}
+
 export function PublicSelector() {
+  const { user, loading: authLoading } = useAuth();
   const [events, setEvents] = useState([]);
   const [arenas, setArenas] = useState([]);
   const [eventId, setEventId] = useState("");
+  const back = workspaceBack(user);
 
   useEffect(() => {
     api.get("/public/events").then((r) => {
@@ -104,9 +114,11 @@ export function PublicSelector() {
           {arenas.length === 0 && <div className="text-zinc-500 text-sm col-span-3">Belum ada gelanggang untuk event ini</div>}
         </div>
 
-        <div className="mt-12">
-          <Link to="/login" className="text-xs tracking-[0.3em] uppercase text-zinc-500 hover:text-[#ffcc00]">← Kembali ke login</Link>
-        </div>
+        {!authLoading && (
+          <div className="mt-12">
+            <Link to={back.to} className="text-xs tracking-[0.3em] uppercase text-zinc-500 hover:text-[#ffcc00]">{back.label}</Link>
+          </div>
+        )}
       </div>
     </div>
   );

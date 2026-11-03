@@ -65,30 +65,30 @@ export default function OperatorDashboard() {
   return (
     <AppShell title="Manajemen Pertandingan">
       <Toaster theme="dark" position="top-right" />
-      <div className="flex flex-wrap items-end gap-3 mb-6">
-        <div className="w-full sm:w-auto">
+      <div className="grid grid-cols-2 md:grid-cols-[minmax(0,18rem)_minmax(0,14rem)_minmax(0,14rem)_minmax(0,14rem)] gap-3 mb-6 items-end">
+        <div className="col-span-2 md:col-span-1 min-w-0">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mb-1">Event</div>
           <Select value={eventId} onValueChange={setEventId}>
-            <SelectTrigger className="w-full sm:w-72 bg-[#141414] border-white/10" data-testid="event-select"><SelectValue/></SelectTrigger>
+            <SelectTrigger className="w-full min-w-0 bg-[#141414] border-white/10" data-testid="event-select"><SelectValue/></SelectTrigger>
             <SelectContent className="bg-[#141414] border-white/10 text-white">
               {events.map((e) => <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>)}
             </SelectContent>
           </Select>
         </div>
-        <div className="w-full sm:w-auto">
+        <div className="min-w-0">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mb-1">Filter Gelanggang</div>
           <Select value={filterArena} onValueChange={setFilterArena}>
-            <SelectTrigger className="w-full sm:w-56 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
+            <SelectTrigger className="w-full min-w-0 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
             <SelectContent className="bg-[#141414] border-white/10 text-white">
               <SelectItem value="all">Semua</SelectItem>
               {arenas.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
             </SelectContent>
           </Select>
         </div>
-        <div className="w-full sm:w-auto">
+        <div className="min-w-0">
           <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400 mb-1">Filter Status</div>
           <Select value={filterStatus} onValueChange={setFilterStatus}>
-            <SelectTrigger className="w-full sm:w-56 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
+            <SelectTrigger className="w-full min-w-0 bg-[#141414] border-white/10"><SelectValue/></SelectTrigger>
             <SelectContent className="bg-[#141414] border-white/10 text-white">
               <SelectItem value="all">Semua</SelectItem>
               <SelectItem value="scheduled">Terjadwal</SelectItem>
@@ -99,7 +99,7 @@ export default function OperatorDashboard() {
             </SelectContent>
           </Select>
         </div>
-        <div className="w-full sm:w-auto sm:ml-auto">
+        <div className="col-span-2 md:col-span-1 min-w-0">
           <MatchCreateDialog eventId={eventId} arenas={arenas} athletes={athletes} rules={rules} classes={classes} onCreated={loadAll} />
         </div>
       </div>
@@ -237,7 +237,7 @@ function MatchCreateDialog({ eventId, arenas, athletes, rules, classes, onCreate
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button data-testid="create-match-btn" disabled={!eventId} className="w-full sm:w-auto bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm tracking-[0.15em] uppercase">
+        <Button data-testid="create-match-btn" disabled={!eventId} className="w-full bg-[#ffcc00] hover:bg-[#e6b800] text-black rounded-sm px-3 tracking-normal md:tracking-[0.12em] uppercase">
           <Plus className="w-4 h-4 mr-2" />Buat Partai
         </Button>
       </DialogTrigger>
