@@ -2940,6 +2940,15 @@ async def _auto_fill_round1(bracket: Dict[str, Any]) -> None:
     if bracket.get("class_id"): q["class_id"] = bracket["class_id"]
     elif bracket.get("category_id"): q["category_id"] = bracket["category_id"]
     athletes = await db.athletes.find(q, {"_id": 0}).to_list(2000)
+    seen_ids = set()
+    unique = []
+    for athlete in athletes:
+        aid = athlete.get("id")
+        if not aid or aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        unique.append(athlete)
+    athletes = unique
     _rnd.shuffle(athletes)
     r1_slots = await db.bracket_slots.find({"bracket_id": bracket["id"], "round": 1}).sort("position", 1).to_list(1024)
     # Fill: first len(athletes) slots get an athlete, rest are byes
@@ -3210,6 +3219,22 @@ async def assign_slot(bid: str, sid: str, data: BracketSlotAssignIn, user=Depend
     slot = await db.bracket_slots.find_one({"id": sid, "bracket_id": bid})
     if not slot or slot.get("round") != 1:
         raise HTTPException(400, "Slot tidak valid (hanya slot ronde 1 yang dapat di-assign)")
+    if data.athlete_id:
+        athlete = await db.athletes.find_one({"id": data.athlete_id}, {"_id": 0, "id": 1, "event_id": 1, "class_id": 1, "category_id": 1, "status": 1})
+        if not athlete or athlete.get("event_id") != b.get("event_id"):
+            raise HTTPException(400, "Peserta tidak ditemukan pada event ini")
+        if athlete.get("status") == "inactive":
+            raise HTTPException(400, "Peserta tidak aktif")
+        if b.get("class_id") and athlete.get("class_id") != b.get("class_id"):
+            raise HTTPException(400, "Peserta bukan dari kelas bagan ini")
+        if not b.get("class_id") and b.get("category_id") and athlete.get("category_id") != b.get("category_id"):
+            raise HTTPException(400, "Peserta bukan dari kategori bagan ini")
+        taken = await db.bracket_slots.find_one(
+            {"bracket_id": bid, "athlete_id": data.athlete_id, "id": {"$ne": sid}},
+            {"_id": 1},
+        )
+        if taken:
+            raise HTTPException(400, "Peserta ini sudah berada di slot lain")
     upd: Dict[str, Any] = {"athlete_id": data.athlete_id, "is_bye": False if data.athlete_id else True}
     await db.bracket_slots.update_one({"id": sid}, {"$set": upd})
     return await _hydrate_bracket(await db.brackets.find_one({"id": bid}, {"_id": 0}))
@@ -3252,6 +3277,14 @@ async def start_bracket(bid: str, user=Depends(require_roles("admin", "operator"
         raise HTTPException(400, "Set arena dan aturan skoring bracket terlebih dahulu")
     # Create round-1 matches; resolve byes immediately
     r1 = await db.bracket_slots.find({"bracket_id": bid, "round": 1}).sort("position", 1).to_list(1024)
+    seen_athletes = []
+    for slot in r1:
+        aid = slot.get("athlete_id")
+        if not aid:
+            continue
+        if aid in seen_athletes:
+            raise HTTPException(400, "Peserta yang sama terpasang di lebih dari satu slot babak 1. Ganti dulu sebelum bagan dimulai.")
+        seen_athletes.append(aid)
     # Iterate pairs (0,1), (2,3), ...
     for i in range(0, len(r1), 2):
         a, c = r1[i], r1[i + 1] if i + 1 < len(r1) else None

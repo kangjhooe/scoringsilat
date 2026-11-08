@@ -314,6 +314,7 @@ export function BracketView({ publicMode = false }) {
   if (!data) return <Wrap publicMode={publicMode}><div className="p-12 text-center text-zinc-500">Memuat...</div></Wrap>;
 
   const winner = data.status === "completed" ? data.slots.find((s) => s.round === Math.max(...data.slots.map((x) => x.round)))?.athlete : null;
+  const usedAthleteIds = new Set((data.slots || []).filter((s) => s.round === 1 && s.athlete_id).map((s) => s.athlete_id));
 
   return (
     <Wrap publicMode={publicMode}>
@@ -332,7 +333,7 @@ export function BracketView({ publicMode = false }) {
           <h1 className="font-display text-3xl md:text-4xl tracking-tight uppercase">{data.name}</h1>
           <div className="text-xs text-zinc-400 mt-1">{[data.class_name, `${data.size} peserta`, `${data.rounds + 1} ronde`, STATUS_LABEL[data.status]].filter(Boolean).join(" · ")}</div>
           {!publicMode && data.status === "draft" && (
-            <div className="text-xs text-zinc-500 mt-2">Seret ikon di kartu babak 1 untuk menukar posisi peserta.</div>
+            <div className="text-xs text-zinc-500 mt-2">Peserta babak 1 bisa diganti lewat daftar di kartu. Seret ikon untuk menukar posisi.</div>
           )}
         </div>
         <div className="flex gap-2 flex-wrap">
@@ -375,6 +376,8 @@ export function BracketView({ publicMode = false }) {
               isFinal={idx === rounds.length - 1}
               slots={slots}
               athletes={athletes}
+              usedAthleteIds={usedAthleteIds}
+              bracket={data}
               canEdit={!publicMode && data.status === "draft" && idx === 0}
               onAssign={assignSlot}
               onSwap={swapSlots}
@@ -405,7 +408,7 @@ function Wrap({ publicMode, children }) {
   return <AppShell title="Bracket">{children}</AppShell>;
 }
 
-function RoundColumn({ roundNum, isFinal, slots, athletes, canEdit, onAssign, onSwap, dragOverId, onDragOverSlot, totalRounds }) {
+function RoundColumn({ roundNum, isFinal, slots, athletes, usedAthleteIds, bracket, canEdit, onAssign, onSwap, dragOverId, onDragOverSlot, totalRounds }) {
   const slotHeight = 84;
   const gap = (Math.pow(2, roundNum - 1) - 1) * slotHeight + (roundNum - 1) * 16;
   return (
@@ -418,7 +421,7 @@ function RoundColumn({ roundNum, isFinal, slots, athletes, canEdit, onAssign, on
         {pairs(slots).map((pair, i) => (
           <div key={i} className="flex flex-col" style={{ gap: roundNum === 1 ? "8px" : "16px" }}>
             {pair.map((slot) => (
-              <SlotCard key={slot.id} slot={slot} athletes={athletes} canEdit={canEdit} onAssign={onAssign} onSwap={onSwap} dragOver={dragOverId === slot.id} onDragOverSlot={onDragOverSlot} />
+              <SlotCard key={slot.id} slot={slot} athletes={athletes} usedAthleteIds={usedAthleteIds} bracket={bracket} canEdit={canEdit} onAssign={onAssign} onSwap={onSwap} dragOver={dragOverId === slot.id} onDragOverSlot={onDragOverSlot} />
             ))}
           </div>
         ))}
@@ -433,13 +436,36 @@ function pairs(arr) {
   return out;
 }
 
-function SlotCard({ slot, athletes, canEdit, onAssign, onSwap, dragOver, onDragOverSlot }) {
+function slotChoices(athletes, slot, usedAthleteIds, bracket) {
+  return athletes.filter((athlete) => {
+    if (athlete.id === slot.athlete_id) return true;
+    if (athlete.status === "inactive") return false;
+    if (bracket?.class_id) {
+      if (athlete.class_id !== bracket.class_id) return false;
+    } else if (bracket?.category_id && athlete.category_id !== bracket.category_id) {
+      return false;
+    }
+    if (usedAthleteIds?.has(athlete.id)) return false;
+    return true;
+  });
+}
+
+function SlotCard({ slot, athletes, usedAthleteIds, bracket, canEdit, onAssign, onSwap, dragOver, onDragOverSlot }) {
   const a = slot.athlete;
   const m = slot.match;
+  const choices = slotChoices(athletes, slot, usedAthleteIds, bracket);
   const isWinner = m && m.winner_corner && ((m.winner_corner === "red" && m.red_athlete_id === a?.id) || (m.winner_corner === "blue" && m.blue_athlete_id === a?.id));
+  const nameBlock = a ? (
+    <>
+      <div className="text-sm font-medium truncate">{a.name}</div>
+      <div className="text-[10px] text-zinc-500 truncate">{a.weight ? `${a.weight} kg` : ""} {a.gender}</div>
+    </>
+  ) : (
+    <div className="text-xs text-zinc-600 italic">{slot.is_bye ? "— bye —" : "menunggu..."}</div>
+  );
   return (
     <div
-      className={`bracket-slot relative w-64 border rounded-sm bg-[#0f0f10] print:bg-white print:text-black ${slot.is_bye ? "border-dashed border-white/10 opacity-50" : isWinner ? "is-winner border-[#ffcc00] bg-[#ffcc00]/5" : "border-white/10"} ${dragOver ? "ring-2 ring-[#ffcc00]" : ""}`}
+      className={`bracket-slot relative w-64 border rounded-sm bg-[#0f0f10] print:bg-white print:text-black ${slot.is_bye ? "border-dashed border-white/10" : isWinner ? "is-winner border-[#ffcc00] bg-[#ffcc00]/5" : "border-white/10"} ${slot.is_bye && !canEdit ? "opacity-50" : ""} ${dragOver ? "ring-2 ring-[#ffcc00]" : ""}`}
       data-testid={`slot-r${slot.round}-p${slot.position}`}
       onDragOver={canEdit ? (e) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = "move"; onDragOverSlot?.(slot.id); } : undefined}
       onDragLeave={canEdit ? (e) => { if (!e.currentTarget.contains(e.relatedTarget)) onDragOverSlot?.(null); } : undefined}
@@ -470,21 +496,14 @@ function SlotCard({ slot, athletes, canEdit, onAssign, onSwap, dragOver, onDragO
           {a?.photo_url ? <img src={resolvePhotoUrl(a.photo_url)} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.style.display = "none"; }}/> : <span className="text-zinc-700 text-xs">—</span>}
         </div>
         <div className="flex-1 min-w-0">
-          {slot.is_bye ? (
-            <div className="text-xs text-zinc-500 italic">— bye —</div>
-          ) : a ? (
+          {canEdit ? (
             <>
-              <div className="text-sm font-medium truncate">{a.name}</div>
-              <div className="text-[10px] text-zinc-500 truncate">{a.weight ? `${a.weight} kg` : ""} {a.gender}</div>
+              <div className="no-print">
+                <AthleteSelector slot={slot} athletes={choices} onAssign={onAssign} />
+              </div>
+              <div className="hidden print:block">{nameBlock}</div>
             </>
-          ) : canEdit ? (
-            <>
-              <div className="no-print"><AthleteSelector slot={slot} athletes={athletes} onAssign={onAssign} /></div>
-              <div className="hidden print:block text-xs">Menunggu</div>
-            </>
-          ) : (
-            <div className="text-xs text-zinc-600 italic">menunggu...</div>
-          )}
+          ) : nameBlock}
         </div>
         {isWinner && <Trophy className="w-3.5 h-3.5 text-[#ffcc00] print:text-black shrink-0"/>}
       </div>
@@ -499,11 +518,13 @@ function SlotCard({ slot, athletes, canEdit, onAssign, onSwap, dragOver, onDragO
 }
 
 function AthleteSelector({ slot, athletes, onAssign }) {
+  const label = (athlete) => `${athlete.name}${athlete.weight ? ` · ${athlete.weight} kg` : ""}`;
   return (
-    <Select onValueChange={(v) => onAssign(slot.id, v)}>
+    <Select key={`${slot.id}-${slot.athlete_id || "empty"}-${athletes.length}`} defaultValue={slot.athlete_id || undefined} onValueChange={(v) => onAssign(slot.id, v === "__clear__" ? null : v)}>
       <SelectTrigger className="bg-[#0a0a0a] border-white/10 h-8 text-xs" data-testid={`slot-assign-${slot.id}`}><SelectValue placeholder="+ pilih peserta"/></SelectTrigger>
       <SelectContent className="bg-[#141414] border-white/10 text-white max-h-64">
-        {athletes.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
+        {slot.athlete_id && <SelectItem value="__clear__">Kosongkan</SelectItem>}
+        {athletes.map((athlete) => <SelectItem key={athlete.id} value={athlete.id}>{label(athlete)}</SelectItem>)}
       </SelectContent>
     </Select>
   );
