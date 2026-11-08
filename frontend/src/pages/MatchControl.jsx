@@ -248,9 +248,9 @@ function JuryPanel({ state, role, refresh, red, blue }) {
   const points = state.rule?.points || { pukulan: 1, tendangan: 2, jatuhan: 3 };
   const windowSec = state.rule?.jury_consensus_window_sec ?? 2;
 
-  const sendScore = async (corner, code, pts) => {
+  const sendScore = async (corner, code) => {
     try {
-      const r = await api.post(`/matches/${state.id}/actions`, { corner, action_type: "score", code, points: pts });
+      const r = await api.post(`/matches/${state.id}/actions`, { corner, action_type: "score", code });
       if (r.data?.pending) toast("Menunggu juri lain");
       else toast.success("Poin masuk");
       await refresh();
@@ -274,8 +274,8 @@ function JuryPanel({ state, role, refresh, red, blue }) {
         </div>
       )}
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-6">
-      <CornerJury corner="red" athlete={red} score={state.red.score} buttons={buttons} disabled={!canScore || resting} onScore={(code, pts) => sendScore("red", code, pts)} />
-      <CornerJury corner="blue" athlete={blue} score={state.blue.score} buttons={buttons} disabled={!canScore || resting} onScore={(code, pts) => sendScore("blue", code, pts)} />
+      <CornerJury corner="red" athlete={red} score={state.red.score} buttons={buttons} disabled={!canScore || resting} onScore={(code) => sendScore("red", code)} />
+      <CornerJury corner="blue" athlete={blue} score={state.blue.score} buttons={buttons} disabled={!canScore || resting} onScore={(code) => sendScore("blue", code)} />
     </div>
     </div>
   );

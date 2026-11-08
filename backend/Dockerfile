@@ -25,4 +25,7 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Trust proxy headers only from localhost. Nginx on the Docker network is not in
+# this list, so a forged X-Forwarded-For cannot replace the TCP peer. The app
+# reads the visitor from X-Real-IP, which Nginx sets itself.
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1"]

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import AppShell from "@/components/AppShell";
-import api, { BACKEND_URL } from "@/lib/api";
+import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,16 +13,6 @@ import { localUploadHref, resolvePhotoUrl } from "@/components/PhotoUpload";
 import { ShieldCheck, ShieldAlert, ShieldX, Trophy, UserCheck, FileText, RefreshCw, Search, ChevronUp, ChevronDown, ChevronsUpDown, Copy } from "lucide-react";
 
 const PRIVATE_DOC_LABELS = new Set(["ktp", "surat_sehat"]);
-
-function registrationFileHref(reg, file) {
-  const label = (file?.label || "").toLowerCase();
-  if (PRIVATE_DOC_LABELS.has(label)) {
-    if (!reg?.id || !file?.id || !(reg.access_code || "").trim()) return "";
-    const params = new URLSearchParams({ access_code: reg.access_code });
-    return `${BACKEND_URL}/api/public/registrations/${reg.id}/files/${file.id}?${params.toString()}`;
-  }
-  return localUploadHref(file?.url);
-}
 
 const STATUS_LABEL = {
   pending_verification: "Menunggu Verifikasi",
@@ -302,6 +292,29 @@ function DetailDialog({ reg, onClose, onChanged }) {
   const isSelectionStage = ["verified", "selection_process"].includes(view.status);
   const isAccepted = view.status === "accepted";
 
+  const openFile = async (file) => {
+    const label = (file?.label || "").toLowerCase();
+    const popup = window.open("about:blank", "_blank");
+    try {
+      let href = "";
+      if (PRIVATE_DOC_LABELS.has(label)) {
+        if (!file?.id) throw new Error("missing");
+        const r = await api.get(`/registrations/${view.id}/files/${file.id}`, { responseType: "blob" });
+        const blob = r.data instanceof Blob ? r.data : new Blob([r.data]);
+        href = URL.createObjectURL(blob);
+        window.setTimeout(() => URL.revokeObjectURL(href), 60000);
+      } else {
+        href = localUploadHref(file?.url) || "";
+      }
+      if (!href) throw new Error("missing");
+      if (popup) popup.location.href = href;
+      else window.location.assign(href);
+    } catch {
+      if (popup) popup.close();
+      toast.error("Berkas tidak dapat dibuka");
+    }
+  };
+
   const copyCode = async () => {
     if (!view.access_code) return;
     try {
@@ -359,23 +372,18 @@ function DetailDialog({ reg, onClose, onChanged }) {
             <div>
               <div className="text-[10px] tracking-[0.2em] uppercase text-zinc-400 mb-2 flex items-center gap-2"><FileText className="w-3.5 h-3.5"/> Dokumen</div>
               <div className="grid grid-cols-3 gap-2">
-                {view.files.map((f) => {
-                  const href = registrationFileHref(view, f);
-                  if (!href) {
-                    return (
-                      <div key={f.id} className="border border-white/10 rounded-sm p-3" data-testid={`file-${f.label}`}>
-                        <div className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">{f.label}</div>
-                        <div className="text-xs text-zinc-500 mt-1 truncate">Berkas tidak tersedia</div>
-                      </div>
-                    );
-                  }
-                  return (
-                    <a key={f.id} href={href} target="_blank" rel="noreferrer" className="border border-white/10 rounded-sm p-3 hover:bg-white/5 transition-colors" data-testid={`file-${f.label}`}>
-                      <div className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">{f.label}</div>
-                      <div className="text-xs text-emerald-300 mt-1 truncate">Lihat berkas →</div>
-                    </a>
-                  );
-                })}
+                {view.files.map((f) => (
+                  <button
+                    key={f.id || f.url}
+                    type="button"
+                    onClick={() => openFile(f)}
+                    className="border border-white/10 rounded-sm p-3 text-left hover:bg-white/5 transition-colors"
+                    data-testid={`file-${f.label}`}
+                  >
+                    <div className="text-[10px] tracking-[0.2em] uppercase text-zinc-400">{f.label}</div>
+                    <div className="text-xs text-emerald-300 mt-1 truncate">Lihat berkas →</div>
+                  </button>
+                ))}
               </div>
             </div>
           )}

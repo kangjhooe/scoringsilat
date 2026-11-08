@@ -115,11 +115,65 @@ input[type="time"]::-webkit-calendar-picker-indicator {
 .bg-corner-red-solid { background: linear-gradient(180deg, #dc2626 0%, #b91c1c 100%); }
 .bg-corner-blue-solid { background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%); }
 
+/* Official letterhead rule: thick line, gap, thin line */
+.letterhead-rule {
+  box-sizing: content-box;
+  margin-top: 8px;
+  height: 0;
+  padding-top: 3px;
+  border-top: 3px solid #000;
+  border-bottom: 1px solid #000;
+}
+
+@page {
+  size: A4;
+  margin: 12mm;
+}
+@page landscape-sheet {
+  size: A4 landscape;
+  margin: 10mm;
+}
+
 /* Print */
 @media print {
-  body { background: white !important; color: black !important; }
+  body {
+    background: white !important;
+    color: black !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
   .no-print { display: none !important; }
-  .print-page { page-break-after: always; }
+  .print-landscape { page: landscape-sheet; }
+  thead { display: table-header-group; }
+  tfoot { display: table-footer-group; }
+  tr, .print-keep { break-inside: avoid; page-break-inside: avoid; }
+  .report-sheet { break-after: page; page-break-after: always; }
+  .report-sheet:last-child { break-after: auto; page-break-after: auto; }
+  .bracket-screen,
+  .bracket-screen main {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  .bracket-tree { overflow: visible !important; }
+  .bracket-screen .bracket-slot {
+    background: #fff !important;
+    color: #000 !important;
+    border-color: #111 !important;
+    box-shadow: none !important;
+  }
+  .bracket-screen .bracket-slot.is-winner {
+    background: #f4f4f5 !important;
+    border-color: #000 !important;
+  }
+  .bracket-screen .bracket-slot .slot-photo {
+    background: #fff !important;
+    border-color: #ccc !important;
+  }
+  .bracket-screen .bracket-slot .slot-meta {
+    border-color: #ddd !important;
+    color: #111 !important;
+  }
+  .bracket-screen .round-label { color: #111 !important; }
 }
 
 /* Public display animated background */

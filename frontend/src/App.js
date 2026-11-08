@@ -13,6 +13,11 @@ import RegistrationsAdmin from "@/pages/RegistrationsAdmin";
 import WAHASettings from "@/pages/WAHASettings";
 import { BracketsList, BracketView } from "@/pages/Brackets";
 import Medals from "@/pages/Medals";
+import PrintSchedule from "@/pages/PrintSchedule";
+import PrintAthletes from "@/pages/PrintAthletes";
+import PrintMedals from "@/pages/PrintMedals";
+import PrintBracket from "@/pages/PrintBracket";
+import PrintReports from "@/pages/PrintReports";
 import SeniScoring from "@/pages/SeniScoring";
 import { PublicSelector, PublicArenaDisplay, PublicMatchDisplay } from "@/pages/PublicDisplay";
 import { EventHome, EventLandingPage } from "@/pages/EventLanding";
@@ -82,6 +87,11 @@ function App() {
           <Route path="/medals" element={<ProtectedRoute roles={["admin", "operator"]}><Medals /></ProtectedRoute>} />
           <Route path="/brackets/:bid" element={<ProtectedRoute roles={["admin", "operator"]}><BracketView /></ProtectedRoute>} />
           <Route path="/report/:matchId" element={<ProtectedRoute><MatchReport /></ProtectedRoute>} />
+          <Route path="/print/schedule" element={<ProtectedRoute roles={["admin", "operator"]}><PrintSchedule /></ProtectedRoute>} />
+          <Route path="/print/athletes" element={<ProtectedRoute roles={["admin", "operator"]}><PrintAthletes /></ProtectedRoute>} />
+          <Route path="/print/medals" element={<ProtectedRoute roles={["admin", "operator"]}><PrintMedals /></ProtectedRoute>} />
+          <Route path="/print/reports" element={<ProtectedRoute roles={["admin", "operator"]}><PrintReports /></ProtectedRoute>} />
+          <Route path="/print/bracket/:bid" element={<ProtectedRoute roles={["admin", "operator"]}><PrintBracket /></ProtectedRoute>} />
 
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

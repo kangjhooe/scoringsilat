@@ -174,6 +174,8 @@ class EventIn(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     logo_url: str = ""
+    institution_name: str = ""
+    institution_logo_url: str = ""
     status: str = "active"
     slug: str = ""
     landing_enabled: bool = True
@@ -296,6 +298,15 @@ class BracketIn(BaseModel):
 
 class BracketSlotAssignIn(BaseModel):
     athlete_id: Optional[str] = None  # null to clear
+
+class BracketSlotSwapIn(BaseModel):
+    slot_a: str
+    slot_b: str
+
+class BracketGenerateIn(BaseModel):
+    event_id: str
+    arena_id: str
+    scoring_rule_id: str
 
 # ============ Seni scoring models ============
 class SeniScoreIn(BaseModel):
@@ -887,7 +898,11 @@ def _is_docker_peer(host: str) -> bool:
     return any(ip in net for net in _DOCKER_PEER_NETS)
 
 def client_ip(request: Request) -> str:
-    """Real client address. Trust X-Real-IP only when the TCP peer is on the Docker network."""
+    """Real client address. Trust X-Real-IP only when the TCP peer is on the Docker network.
+
+    Uvicorn must not rewrite that peer from X-Forwarded-For. Nginx overwrites
+    X-Real-IP with the visitor address (CF-Connecting-IP behind Cloudflare).
+    """
     peer = request.client.host if request.client and request.client.host else ""
     if _is_docker_peer(peer):
         forwarded = _coerce_ip(request.headers.get("x-real-ip") or "")
@@ -1046,6 +1061,8 @@ def normalize_public_event(event: Dict[str, Any]) -> Dict[str, Any]:
     out["landing_contact"] = out.get("landing_contact", "")
     out["landing_requirements"] = out.get("landing_requirements", "")
     out["landing_schedule_note"] = out.get("landing_schedule_note", "")
+    out["institution_name"] = out.get("institution_name") or ""
+    out["institution_logo_url"] = out.get("institution_logo_url") or ""
     return out
 
 # ============ Generic CRUD helpers ============
@@ -1595,23 +1612,6 @@ def _registration_file_path(rec: Dict[str, Any]) -> Path:
         return _private_upload_path(url)
     return _local_upload_path(url)
 
-@api.get("/public/registrations/{rid}/files/{fid}")
-async def public_download_registration_file(rid: str, fid: str, request: Request, access_code: str = ""):
-    """Stream a registration file only when the access code matches. Same denial as lookup."""
-    enforce_rate_limit(request, "public_file", PUBLIC_LOOKUP_LIMIT, PUBLIC_LOOKUP_WINDOW_SEC)
-    reg = await db.registrations.find_one({"id": rid}, {"_id": 0, "access_code": 1})
-    stored = ((reg or {}).get("access_code") or "").strip()
-    if not reg or not _access_codes_match(stored, (access_code or "").strip()):
-        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
-    rec = await db.registration_files.find_one({"id": fid, "registration_id": rid}, {"_id": 0})
-    if not rec:
-        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
-    try:
-        path = _registration_file_path(rec)
-    except HTTPException:
-        raise HTTPException(404, _PUBLIC_LOOKUP_DENIED)
-    return FileResponse(path)
-
 @api.post("/public/registrations/lookup")
 async def public_lookup_registration(data: RegistrationLookupIn, request: Request):
     """Status check for the participant who has both the number and the access code.
@@ -1723,6 +1723,18 @@ async def delete_registration(rid: str, user=Depends(require_roles("admin"))):
         except Exception as exc:
             print(f"[athletes] cleanup failed for reg {rid}: {exc}")
     return {"ok": True}
+
+@api.get("/registrations/{rid}/files/{fid}")
+async def download_registration_file(rid: str, fid: str, user=Depends(require_roles("admin", "operator"))):
+    """KTP and health letters. The access code stays out of the URL and the access log."""
+    rec = await db.registration_files.find_one({"id": fid, "registration_id": rid}, {"_id": 0})
+    if not rec:
+        raise HTTPException(404, "Berkas tidak ditemukan")
+    try:
+        path = _registration_file_path(rec)
+    except HTTPException:
+        raise HTTPException(404, "Berkas tidak ditemukan")
+    return FileResponse(path, content_disposition_type="inline")
 
 @api.delete("/registrations/{rid}/files/{fid}")
 async def delete_registration_file(rid: str, fid: str, user=Depends(require_roles("admin", "operator"))):
@@ -2487,12 +2499,26 @@ async def delete_match(mid: str, user=Depends(require_roles("admin", "operator")
     return {"ok": True}
 
 def _action_points(data: ScoreActionIn, rule: Dict[str, Any]) -> int:
-    points = data.points
-    if points == 0 and rule:
-        if data.action_type in ("score", "fall"):
-            points = int(rule.get("points", {}).get(data.code, 0))
-        elif data.action_type == "penalty":
-            points = int(rule.get("penalty_points", {}).get(data.code, 0))
+    """Use the match rule. A number sent by the browser is never the score."""
+    rule = rule or {}
+    if data.action_type == "score":
+        table = rule.get("points") or {}
+        label = "skor"
+    elif data.action_type == "penalty":
+        table = rule.get("penalty_points") or {}
+        label = "hukuman"
+    elif data.action_type in ("binaan", "absolute_win", "fall"):
+        return 0
+    else:
+        raise HTTPException(400, "Jenis tindakan tidak dikenal")
+    if not isinstance(table, dict) or data.code not in table:
+        raise HTTPException(400, f"Kode {label} tidak ada di aturan partai")
+    try:
+        points = int(table[data.code])
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Nilai poin pada aturan tidak valid")
+    if points < 0:
+        raise HTTPException(400, "Nilai poin pada aturan tidak valid")
     return points
 
 async def _apply_jury_consensus(mid: str, match: Dict[str, Any], data: ScoreActionIn, user: Dict[str, Any], role: str, points: int, rule: Dict[str, Any]) -> Dict[str, Any]:
@@ -2857,9 +2883,15 @@ async def approve_match(mid: str, data: ApproveIn, user=Depends(require_roles("h
 import math
 import random as _rnd
 
+BRACKET_MAX_SIZE = 32
+
 def _next_pow2(n: int) -> int:
     if n <= 1: return 2
     return 1 << (n - 1).bit_length()
+
+def _bracket_size_for_athletes(count: int) -> int:
+    """Smallest power of two from 2 to 32 that can hold this many athletes."""
+    return _next_pow2(max(1, min(count, BRACKET_MAX_SIZE)))
 
 async def _build_bracket_slots(bracket_id: str, size: int) -> List[Dict[str, Any]]:
     """Create all slots for a single elimination bracket. Returns list of inserted slot docs.
@@ -2934,7 +2966,37 @@ async def _hydrate_bracket(bracket: Dict[str, Any]) -> Dict[str, Any]:
     bracket["slots"] = slots
     # rounds count
     bracket["rounds"] = int(math.log2(bracket["size"])) if bracket.get("size") else 0
+    await _attach_bracket_print_meta(bracket)
     return bracket
+
+
+async def _attach_bracket_print_meta(bracket: Dict[str, Any]) -> None:
+    """Class name and letterhead fields for the paper bracket. Logos are already public."""
+    bracket["class_name"] = ""
+    if bracket.get("class_id"):
+        cls = await db.classes.find_one({"id": bracket["class_id"]}, {"_id": 0, "name": 1})
+        bracket["class_name"] = (cls or {}).get("name") or ""
+    bracket["event"] = None
+    if not bracket.get("event_id"):
+        return
+    ev = await db.events.find_one({"id": bracket["event_id"]}, {
+        "_id": 0, "id": 1, "name": 1, "code": 1, "location": 1,
+        "start_date": 1, "end_date": 1, "logo_url": 1,
+        "institution_name": 1, "institution_logo_url": 1,
+    })
+    if not ev:
+        return
+    bracket["event"] = {
+        "id": ev.get("id") or "",
+        "name": ev.get("name") or "",
+        "code": ev.get("code") or "",
+        "location": ev.get("location") or "",
+        "start_date": ev.get("start_date"),
+        "end_date": ev.get("end_date"),
+        "logo_url": ev.get("logo_url") or "",
+        "institution_name": ev.get("institution_name") or "",
+        "institution_logo_url": ev.get("institution_logo_url") or "",
+    }
 
 async def _create_match_for_slot(bracket: Dict[str, Any], slot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Given a parent slot (round >= 2) whose source_a and source_b both have athletes, create a match.
@@ -3019,20 +3081,95 @@ async def _create_bracket_match(bracket: Dict[str, Any], destination: Dict[str, 
     match.pop("_id", None)
     return match
 
-@api.post("/brackets")
-async def create_bracket(data: BracketIn, user=Depends(require_roles("admin", "operator"))):
-    size = _next_pow2(max(2, int(data.size)))
-    doc = data.model_dump()
+async def _create_draft_bracket(payload: Dict[str, Any], *, size: int, auto_fill: bool) -> Dict[str, Any]:
+    doc = dict(payload)
     doc.update({
-        "id": new_id(), "size": size, "status": "draft",
+        "id": new_id(), "size": size, "status": "draft", "auto_fill": auto_fill,
         "created_at": now_iso(), "winner_athlete_id": None, "finished_at": None,
     })
     await db.brackets.insert_one(doc)
     await _build_bracket_slots(doc["id"], size)
-    if data.auto_fill:
+    if auto_fill:
         await _auto_fill_round1(doc)
     doc.pop("_id", None)
+    return doc
+
+@api.post("/brackets")
+async def create_bracket(data: BracketIn, user=Depends(require_roles("admin", "operator"))):
+    size = _next_pow2(max(2, int(data.size)))
+    doc = await _create_draft_bracket(data.model_dump(), size=size, auto_fill=data.auto_fill)
     return await _hydrate_bracket(doc)
+
+@api.post("/brackets/generate")
+async def generate_brackets(data: BracketGenerateIn, user=Depends(require_roles("admin", "operator"))):
+    """One draft single-elimination bracket per tanding class that has active athletes."""
+    event = await db.events.find_one({"id": data.event_id}, {"_id": 0, "id": 1})
+    if not event:
+        raise HTTPException(404, "Event tidak ditemukan")
+    arena = await db.arenas.find_one({"id": data.arena_id, "event_id": data.event_id}, {"_id": 0, "id": 1})
+    if not arena:
+        raise HTTPException(400, "Arena tidak ditemukan pada event ini")
+    rule = await db.scoring_rules.find_one({"id": data.scoring_rule_id, "event_id": data.event_id}, {"_id": 0, "id": 1, "category_type": 1})
+    if not rule:
+        raise HTTPException(400, "Aturan skoring tidak ditemukan pada event ini")
+    if (rule.get("category_type") or "tanding") != "tanding":
+        raise HTTPException(400, "Aturan skoring harus untuk kategori tanding")
+
+    classes = await db.classes.find({"event_id": data.event_id}, {"_id": 0}).sort("name", 1).to_list(2000)
+    categories = {
+        c["id"]: c
+        async for c in db.categories.find({"event_id": data.event_id}, {"_id": 0, "id": 1, "name": 1, "type": 1})
+    }
+    existing = await db.brackets.find({"event_id": data.event_id}, {"_id": 0, "class_id": 1}).to_list(2000)
+    taken = {b.get("class_id") for b in existing if b.get("class_id")}
+
+    created: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for cls in classes:
+        category = categories.get(cls.get("category_id") or "")
+        category_type = (category or {}).get("type") or ""
+        label = cls.get("name") or "Kelas"
+        if category and category.get("name"):
+            label = f"{category['name']} — {cls.get('name') or 'Kelas'}"
+        athlete_count = await db.athletes.count_documents({
+            "event_id": data.event_id,
+            "class_id": cls["id"],
+            "status": {"$ne": "inactive"},
+        })
+        if category_type != "tanding":
+            if athlete_count:
+                reason = "Bukan kategori tanding" if category_type else "Kategori tidak ditemukan"
+                skipped.append({"class_id": cls["id"], "name": label, "reason": reason, "athlete_count": athlete_count})
+            continue
+        if cls["id"] in taken:
+            skipped.append({"class_id": cls["id"], "name": label, "reason": "Sudah punya bagan", "athlete_count": athlete_count})
+            continue
+        if athlete_count < 1:
+            skipped.append({"class_id": cls["id"], "name": label, "reason": "Tidak ada peserta aktif", "athlete_count": 0})
+            continue
+        if athlete_count > BRACKET_MAX_SIZE:
+            skipped.append({
+                "class_id": cls["id"], "name": label,
+                "reason": f"Peserta aktif {athlete_count} melebihi {BRACKET_MAX_SIZE}",
+                "athlete_count": athlete_count,
+            })
+            continue
+        size = _bracket_size_for_athletes(athlete_count)
+        doc = await _create_draft_bracket({
+            "event_id": data.event_id,
+            "class_id": cls["id"],
+            "category_id": cls.get("category_id"),
+            "name": label,
+            "discipline": "tanding",
+            "arena_id": data.arena_id,
+            "scoring_rule_id": data.scoring_rule_id,
+            "size": size,
+        }, size=size, auto_fill=True)
+        created.append({
+            "id": doc["id"], "name": doc["name"], "class_id": cls["id"],
+            "size": size, "athlete_count": athlete_count,
+        })
+    return {"created": created, "skipped": skipped}
 
 @api.get("/brackets")
 async def list_brackets(event_id: Optional[str] = None, user=Depends(get_current_user)):
@@ -3075,6 +3212,32 @@ async def assign_slot(bid: str, sid: str, data: BracketSlotAssignIn, user=Depend
         raise HTTPException(400, "Slot tidak valid (hanya slot ronde 1 yang dapat di-assign)")
     upd: Dict[str, Any] = {"athlete_id": data.athlete_id, "is_bye": False if data.athlete_id else True}
     await db.bracket_slots.update_one({"id": sid}, {"$set": upd})
+    return await _hydrate_bracket(await db.brackets.find_one({"id": bid}, {"_id": 0}))
+
+@api.post("/brackets/{bid}/slots/swap")
+async def swap_slots(bid: str, data: BracketSlotSwapIn, user=Depends(require_roles("admin", "operator"))):
+    """Swap two round-1 slots while the bracket is still a draft. Later rounds stay untouched."""
+    b = await db.brackets.find_one({"id": bid})
+    if not b:
+        raise HTTPException(404, "Bracket tidak ditemukan")
+    if b.get("status") != "draft":
+        raise HTTPException(400, "Hanya bagan berstatus draft yang dapat diubah")
+    if data.slot_a == data.slot_b:
+        return await _hydrate_bracket(await db.brackets.find_one({"id": bid}, {"_id": 0}))
+    first = await db.bracket_slots.find_one({"id": data.slot_a, "bracket_id": bid})
+    second = await db.bracket_slots.find_one({"id": data.slot_b, "bracket_id": bid})
+    if not first or not second or first.get("round") != 1 or second.get("round") != 1:
+        raise HTTPException(400, "Hanya slot babak 1 yang dapat ditukar")
+    if first.get("match_id") or second.get("match_id"):
+        raise HTTPException(400, "Slot yang sudah punya pertandingan tidak dapat ditukar")
+    await db.bracket_slots.update_one(
+        {"id": first["id"]},
+        {"$set": {"athlete_id": second.get("athlete_id"), "is_bye": not bool(second.get("athlete_id"))}},
+    )
+    await db.bracket_slots.update_one(
+        {"id": second["id"]},
+        {"$set": {"athlete_id": first.get("athlete_id"), "is_bye": not bool(first.get("athlete_id"))}},
+    )
     return await _hydrate_bracket(await db.brackets.find_one({"id": bid}, {"_id": 0}))
 
 @api.post("/brackets/{bid}/start")
@@ -3356,6 +3519,45 @@ async def event_medals(eid: str, user=Depends(require_roles("admin", "operator")
 async def public_event_medals(eid: str):
     return await _event_medals(eid)
 
+@api.get("/events/{eid}/match-reports")
+async def event_match_reports(eid: str, user=Depends(require_roles("admin", "operator"))):
+    """Finished and approved matches, with scores, logs, and seni totals, for bulk printing."""
+    event = await db.events.find_one({"id": eid}, {"_id": 0})
+    if not event:
+        raise HTTPException(404, "Event tidak ditemukan")
+    matches = await db.matches.find(
+        {"event_id": eid, "status": {"$in": ["finished", "approved"]}},
+        {"_id": 0, "id": 1, "match_number": 1},
+    ).sort("match_number", 1).to_list(2000)
+    ids = [m["id"] for m in matches]
+    logs_by: Dict[str, List[Dict[str, Any]]] = {mid: [] for mid in ids}
+    if ids:
+        all_logs = await db.score_logs.find({"match_id": {"$in": ids}}, {"_id": 0}).sort("timestamp", 1).to_list(50000)
+        for log in all_logs:
+            logs_by.setdefault(log.get("match_id"), []).append(log)
+    arenas = await db.arenas.find({"event_id": eid}, {"_id": 0}).to_list(200)
+    athletes = await db.athletes.find({"event_id": eid}, {"_id": 0}).to_list(5000)
+    reports = []
+    for row in matches:
+        state = await compute_match_state(row["id"])
+        if not state:
+            continue
+        state.pop("pending_votes", None)
+        state.pop("rule", None)
+        seni = None
+        if (state.get("discipline") or "tanding") != "tanding":
+            summary = await _seni_summary(row["id"])
+            raw = await db.matches.find_one({"id": row["id"]}, {"_id": 0})
+            seni = await _attach_match_athletes(summary, raw or state)
+            seni.pop("match", None)
+        reports.append({"state": state, "logs": logs_by.get(row["id"], []), "seni": seni})
+    return {
+        "event": normalize_public_event(event),
+        "arenas": arenas,
+        "athletes": athletes,
+        "reports": reports,
+    }
+
 # ============ Routes: Seni Scoring (Tunggal/Ganda/Regu) ============
 async def _seni_summary(mid: str) -> Dict[str, Any]:
     scores = await db.seni_scores.find({"match_id": mid}, {"_id": 0}).sort("jury_position", 1).to_list(20)
@@ -3506,6 +3708,40 @@ async def finalize_seni(mid: str, user=Depends(require_roles("head_jury", "admin
     return await _seni_summary(mid)
 
 # ============ WebSocket endpoints ============
+WS_AUTH_TIMEOUT_SEC = 10
+
+def _token_from_ws_message(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.lower().startswith("bearer "):
+        return text[7:].strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return ""
+        if isinstance(payload, dict) and payload.get("token"):
+            return str(payload["token"]).strip()
+        return ""
+    return text
+
+async def _user_from_access_token(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+    except jwt.PyJWTError:
+        return None
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+    return await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+
+async def _close_ws(websocket: WebSocket, code: int = 1008) -> None:
+    try:
+        await websocket.close(code=code)
+    except Exception:
+        pass
+
 @app.websocket("/api/ws/arena/{arena_id}")
 async def ws_arena(websocket: WebSocket, arena_id: str):
     room = f"arena:{arena_id}"
@@ -3527,18 +3763,31 @@ async def ws_arena(websocket: WebSocket, arena_id: str):
 
 @app.websocket("/api/ws/match/{match_id}")
 async def ws_match(websocket: WebSocket, match_id: str):
+    """Jury socket. The first frame must be a login token; pending votes stay in this room."""
+    await websocket.accept()
     room = f"match:{match_id}"
-    await manager.connect(room, websocket)
+    joined = False
     try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=WS_AUTH_TIMEOUT_SEC)
+        user = await _user_from_access_token(_token_from_ws_message(raw))
+        if not user:
+            await _close_ws(websocket)
+            return
+        async with manager.lock:
+            manager.rooms.setdefault(room, []).append(websocket)
+        joined = True
         await _load_match_settled(match_id)
         state = await compute_match_state(match_id)
         await websocket.send_text(json.dumps({"type": "initial", "match_id": match_id, "state": state}, default=str))
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        await manager.disconnect(room, websocket)
+        pass
     except Exception:
-        await manager.disconnect(room, websocket)
+        await _close_ws(websocket)
+    finally:
+        if joined:
+            await manager.disconnect(room, websocket)
 
 @app.websocket("/api/ws/public/match/{match_id}")
 async def ws_public_match(websocket: WebSocket, match_id: str):
@@ -3728,6 +3977,8 @@ async def seed_demo_event():
         "start_date": "2026-03-01",
         "end_date": "2026-03-07",
         "logo_url": "",
+        "institution_name": "",
+        "institution_logo_url": "",
         "status": "active",
         "landing_enabled": True,
         "registration_enabled": True,

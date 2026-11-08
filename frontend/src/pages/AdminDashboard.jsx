@@ -94,6 +94,8 @@ const EMPTY_EVENT = {
   start_date: "",
   end_date: "",
   logo_url: "",
+  institution_name: "",
+  institution_logo_url: "",
   status: "active",
   slug: "",
   landing_enabled: true,
@@ -116,6 +118,8 @@ function eventToForm(e = {}) {
     start_date: e.start_date || "",
     end_date: e.end_date || "",
     logo_url: e.logo_url || "",
+    institution_name: e.institution_name || "",
+    institution_logo_url: e.institution_logo_url || "",
     status: e.status || "active",
     slug: e.slug || "",
     landing_enabled: e.landing_enabled !== false,
@@ -246,7 +250,7 @@ function EventsSidebar({ events, selectedId, onSelect, onChanged, loading, editR
 
   const q = query.trim().toLowerCase();
   const filtered = q
-    ? events.filter((e) => [e.name, e.code, e.location].some((v) => String(v || "").toLowerCase().includes(q)))
+    ? events.filter((e) => [e.name, e.code, e.location, e.institution_name].some((v) => String(v || "").toLowerCase().includes(q)))
     : events;
   const showSearch = events.length > 5 || query.length > 0;
 
@@ -274,11 +278,12 @@ function EventsSidebar({ events, selectedId, onSelect, onChanged, loading, editR
         </div>
       )}
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="bg-[#141414] border-white/10 text-white max-w-md">
+        <DialogContent className="bg-[#141414] border-white/10 text-white max-w-md max-h-[90vh] overflow-y-auto">
           <DialogHeader><DialogTitle className="font-display text-2xl uppercase tracking-tight">{editing ? "Edit Event" : "Event Baru"}</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <Field label="Nama Event"><Input data-testid="event-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="bg-[#0a0a0a] border-white/10" /></Field>
             <Field label="Kode Event (untuk No. Registrasi & Peserta)"><Input data-testid="event-code-input" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value.toUpperCase() })} placeholder="contoh: KEJURNAS2026" className="bg-[#0a0a0a] border-white/10 font-mono uppercase" /></Field>
+            <Field label="Nama Lembaga"><Input data-testid="event-institution-input" value={form.institution_name} onChange={(e) => setForm({ ...form, institution_name: e.target.value })} placeholder="contoh: IPSI Kabupaten Pesisir Barat" className="bg-[#0a0a0a] border-white/10" /></Field>
             <Field label="Lokasi"><Input data-testid="event-location-input" value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} className="bg-[#0a0a0a] border-white/10" /></Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Tanggal Mulai"><Input type="date" value={form.start_date} onChange={(e) => setForm({ ...form, start_date: e.target.value })} className="bg-[#0a0a0a] border-white/10" /></Field>
@@ -295,6 +300,7 @@ function EventsSidebar({ events, selectedId, onSelect, onChanged, loading, editR
                 </SelectContent>
               </Select>
             </Field>
+            <PhotoUpload value={form.institution_logo_url} onChange={(v) => setForm({ ...form, institution_logo_url: v })} label="Logo Lembaga (opsional)" testIdPrefix="event-institution-logo" />
             <PhotoUpload value={form.logo_url} onChange={(v) => setForm({ ...form, logo_url: v })} label="Logo Event (opsional)" testIdPrefix="event-logo" />
           </div>
           <DialogFooter>
@@ -399,6 +405,7 @@ function EventDetail({ event, onChanged, onEdit }) {
               <EventStatusPill status={event.status} />
               {event.code ? <span className="font-mono text-[11px] text-zinc-400">{event.code}</span> : null}
             </div>
+            {event.institution_name ? <div className="text-[11px] tracking-[0.16em] uppercase text-zinc-500 mb-1">{event.institution_name}</div> : null}
             <h2 className="font-display text-3xl uppercase leading-none tracking-tight">{event.name}</h2>
             <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm text-zinc-400">
               {event.location ? <span className="inline-flex items-center gap-1.5"><MapPin className="h-3.5 w-3.5" />{event.location}</span> : null}

@@ -8,7 +8,7 @@ export function wsUrlFor(path) {
 
 export function openMatchSocket(matchId, onMessage) {
   const url = wsUrlFor(`/ws/match/${matchId}`);
-  return openWS(url, onMessage);
+  return openWS(url, onMessage, { authorize: true });
 }
 
 export function openArenaSocket(arenaId, onMessage) {
@@ -21,7 +21,7 @@ export function openPublicMatchSocket(matchId, onMessage) {
   return openWS(url, onMessage);
 }
 
-function openWS(url, onMessage) {
+function openWS(url, onMessage, { authorize = false } = {}) {
   let ws;
   let closed = false;
   let reconnectDelay = 1000;
@@ -31,6 +31,9 @@ function openWS(url, onMessage) {
     ws = new WebSocket(url);
     ws.onopen = () => {
       reconnectDelay = 1000;
+      if (authorize) {
+        try { ws.send(localStorage.getItem("silat_token") || ""); } catch (e) { /* noop */ }
+      }
       pingInterval = setInterval(() => {
         try { ws.send("ping"); } catch (e) { /* noop */ }
       }, 25000);
@@ -41,9 +44,9 @@ function openWS(url, onMessage) {
         onMessage?.(msg);
       } catch (err) { /* noop */ }
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       clearInterval(pingInterval);
-      if (!closed) setTimeout(connect, reconnectDelay = Math.min(reconnectDelay * 1.5, 8000));
+      if (!closed && event.code !== 1008) setTimeout(connect, reconnectDelay = Math.min(reconnectDelay * 1.5, 8000));
     };
     ws.onerror = () => {
       try { ws.close(); } catch (e) { /* noop */ }

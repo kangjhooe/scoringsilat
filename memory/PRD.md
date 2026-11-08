@@ -99,7 +99,50 @@ Build a web-based real-time digital scoring application for pencak silat competi
 - DialogDescription / aria-describedby polish
 - Contingent dedupe via casefold
 
+## Cetak PDF — dikerjakan (2026-11-08)
+
+Cetak tetap `window.print()` di tab yang sama (dialog browser, bukan unduhan langsung dan bukan tab baru). Tidak ada generator PDF di server. Nama berkas mengikuti `document.title`.
+
+Yang sudah ada:
+- Laporan partai `/report/:matchId` — lembar putih, kop resmi, header log berulang, nama wasit/operator/ketua juri di garis tanda tangan.
+- Bagan `/brackets/:bid` — cetak terang, landscape, judul + kelas tampil. Tautan "Buka" dan menu AppShell tidak ikut kertas.
+
+Rapikan dulu:
+- [x] Hapus `page-break-after: always` yang menambah halaman kosong di laporan
+- [x] `@page` A4 + margin, `document.title` sebelum cetak supaya nama file PDF jelas
+- [x] Ulangi header tabel log yang panjang; isi nama wasit/operator di garis tanda tangan
+- [x] Bagan: stylesheet cetak terang, landscape, judul + kelas tetap tampil, sembunyikan tautan "Buka" dan menu AppShell
+
+Kop yang disepakati:
+- [x] Field event: `institution_name` + `institution_logo_url`, terpisah dari nama event dan logo event
+- [x] Kop resmi: logo lembaga kiri, nama lembaga (kecil) + nama event (besar) + tempat/tanggal di tengah, logo event kanan, garis ganda di bawah, lalu jenis dokumen
+
+Dokumen baru:
+- [x] Jadwal partai `/print/schedule?event=` — per gelanggang atau babak
+- [x] Lembar medali `/print/medals?event=` — satu lembar per kelas (Excel tetap terpisah)
+- [x] Bagan versi kertas `/print/bracket/:bid`
+- [x] Daftar peserta `/print/athletes?event=` — per kelas atau kontingen
+- [x] Cetak massal `/print/reports?event=` — partai selesai dan disahkan
+
+## Identitas aplikasi + PWA — dikerjakan nanti (2026-11-08)
+
+Satu pemasangan PWA = satu identitas produk. Nama dan logo event tetap terpisah (landing, laporan, display). Ini hanya perlu kalau satu server harus tampil sebagai aplikasi penyelenggara (nama, logo, ikon layar utama), bukan kalau yang berganti hanya kejuaraan.
+
+Default bila admin belum mengisi: tetap "Silat Scoring" / "Silat" / "Sistem Penilaian Digital", monogram "S", tema `#0a0a0a`.
+
+- [ ] Pengaturan admin (satu dokumen): `name`, `short_name` (sekitar 12 karakter), `tagline`, `description`, `logo_url` (header, boleh lebar), ikon kotak (terpisah dari logo), `theme_color`, `background_color`
+- [ ] `GET /api/public/branding` tanpa login. Context React untuk header (`AppShell`), login (`Login` / `BrandMark`), navigasi publik (`EventLanding`), `document.title`, dan meta `theme-color`
+- [ ] `/manifest.webmanifest` diisi dari pengaturan yang sama. URL manifest tidak diganti. `"id": "/"` tetap stabil. `start_url`, `scope`, dan `display` tidak ikut pengaturan
+- [ ] Dari satu gambar kotak minimal 512 px (lebih aman 1024): hasilkan ikon 192, 512, 512 maskable (padding sekitar 20%), apple-touch 180, dan favicon 32. URL ikon berversi (`?v=`)
+- [ ] Service worker: manifest network-first dan tidak di-preload di `silat-shell-v1`. Ikon boleh di-cache karena URL berversi. Naikkan nama cache saat perilaku worker berubah
+- [ ] nginx sudah `no-cache` untuk manifest, tetapi `.png` di-cache 30 hari — andalkan URL berversi, jangan menimpa berkas ikon di path yang sama
+- [ ] Layar utama iPhone memakai nama dan ikon saat "Add to Home Screen" (`apple-mobile-web-app-title`, `apple-touch-icon` di `index.html`). Identitas sebaiknya ditetapkan sebelum panitia memasang aplikasi
+
+Tidak diubah: warna aksen `#ffcc00`, kunci `localStorage` `silat_token`, logo per event.
+
 ## Next tasks
+- Cetak PDF: selesai (laporan, bagan, kop lembaga, jadwal, medali, peserta, laporan massal)
+- Identitas aplikasi + PWA: nama, logo, dan ikon layar utama bisa diatur admin (lihat bagian di atas)
 - (Optional) Add automated pytest coverage for Bracket advancement + Seni finalize + WAHA hook flows
 - (Optional) Drag-to-reorder slots in BracketView
 - AdminDashboard tab stability re-verification (sempat di-skip oleh user)

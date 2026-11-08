@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import AppShell from "@/components/AppShell";
 import api, { formatApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog";
 import { toast, Toaster } from "sonner";
-import { Plus, Trash2, Play, ListChecks, Trophy, FileText, Tv } from "lucide-react";
+import { Plus, Trash2, Play, ListChecks, Trophy, FileText, Tv, Printer } from "lucide-react";
 
 export default function OperatorDashboard() {
   const nav = useNavigate();
@@ -104,6 +104,15 @@ export default function OperatorDashboard() {
         </div>
       </div>
 
+      {eventId && (
+        <div className="flex flex-wrap gap-2 mb-6">
+          <PrintLink to={`/print/schedule?event=${eventId}`} testId="print-schedule-link">Jadwal</PrintLink>
+          <PrintLink to={`/print/athletes?event=${eventId}`} testId="print-athletes-link">Daftar Peserta</PrintLink>
+          <PrintLink to={`/print/medals?event=${eventId}`} testId="print-medals-link">Lembar Medali</PrintLink>
+          <PrintLink to={`/print/reports?event=${eventId}`} testId="print-reports-link">Laporan Selesai</PrintLink>
+        </div>
+      )}
+
       {filtered.length === 0 ? (
         <div className="border border-dashed border-white/10 rounded-sm p-12 text-center text-zinc-500">
           <ListChecks className="w-12 h-12 mx-auto mb-3 text-zinc-700" />
@@ -152,6 +161,14 @@ export default function OperatorDashboard() {
         </div>
       )}
     </AppShell>
+  );
+}
+
+function PrintLink({ to, testId, children }) {
+  return (
+    <Button asChild variant="ghost" className="border border-white/10 hover:bg-white/5 text-xs uppercase tracking-[0.15em] text-zinc-200">
+      <Link to={to} data-testid={testId}><Printer className="w-3.5 h-3.5 mr-1.5" />{children}</Link>
+    </Button>
   );
 }
 

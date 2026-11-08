@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { resolvePhotoUrl } from "@/components/PhotoUpload";
 import { toast, Toaster } from "sonner";
-import { Download, Eye, Medal } from "lucide-react";
+import { Download, Eye, Medal, Printer } from "lucide-react";
 
 const PUB = axios.create({ baseURL: `${BACKEND_URL}/api` });
 
@@ -175,6 +175,13 @@ function MedalsBody({ publicMode, events, eventId, onEvent, data, loading, error
             >
               <Download className="w-4 h-4 mr-2" />{exporting ? "Mengunduh..." : "Unduh Excel"}
             </Button>
+          )}
+          {!publicMode && eventId && (
+            <Link to={`/print/medals?event=${eventId}`}>
+              <Button variant="ghost" className="border border-white/10 hover:bg-white/5 text-xs uppercase tracking-[0.15em]" data-testid="medals-print-link">
+                <Printer className="w-4 h-4 mr-2" />Cetak Lembar
+              </Button>
+            </Link>
           )}
           {!publicMode && eventId && (
             <Link to={`/medals/${eventId}/public`} target="_blank">
