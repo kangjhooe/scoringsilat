@@ -508,6 +508,73 @@ def _consume_timer(timer: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     return timer
 
 
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number
+
+
+def _round_count(rule: Optional[Dict[str, Any]]) -> int:
+    count = _safe_int((rule or {}).get("round_count"), 3)
+    return count if count > 0 else 3
+
+
+def _rest_seconds(rule: Optional[Dict[str, Any]]) -> int:
+    rest = _safe_int((rule or {}).get("rest_duration_sec"), 0)
+    return rest if rest > 0 else 0
+
+
+def _clock_moved(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    if after is before:
+        return False
+    if before.get("status") != after.get("status"):
+        return True
+    if before.get("current_round") != after.get("current_round"):
+        return True
+    return (before.get("timer") or {}) != (after.get("timer") or {})
+
+
+def _parked_round_timer(round_no: int, round_duration: int) -> Dict[str, Any]:
+    return {
+        "running": False,
+        "remaining_sec": round_duration,
+        "started_at": None,
+        "round": round_no,
+        "phase": "round",
+    }
+
+
+def _running_rest_timer(round_no: int, rest: int, now: datetime) -> Dict[str, Any]:
+    return {
+        "running": True,
+        "remaining_sec": rest,
+        "started_at": now.isoformat(),
+        "round": round_no,
+        "phase": "rest",
+    }
+
+
+async def _save_clock(match: Dict[str, Any], timer: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Save only if the round we observed is still current, so two expirations cannot skip a round."""
+    observed = match.get("timer") or {}
+    query: Dict[str, Any] = {
+        "id": match["id"],
+        "status": match.get("status"),
+        "current_round": match.get("current_round"),
+        "timer.phase": observed.get("phase") or "round",
+    }
+    result = await db.matches.update_one(query, {"$set": {"timer": timer, **extra}})
+    if result.matched_count == 0:
+        fresh = await db.matches.find_one({"id": match["id"]})
+        return fresh or match
+    updated = dict(match)
+    updated["timer"] = timer
+    updated.update(extra)
+    return updated
+
+
 def _ensure_round(per_round: Dict[int, Dict[str, int]], rnd: Any) -> int:
     try:
         rnd = int(rnd or 1)
@@ -580,34 +647,62 @@ async def compute_match_state(match_id: str) -> Dict[str, Any]:
 
 
 async def settle_expired_timer(match: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist a running timer that has reached 0 as paused. Returns the match to use afterwards."""
-    if not match or match.get("status") != "in_progress":
+    """When a round clock hits zero, start the rest countdown. When rest hits zero, arm the next round at its full duration and wait for Mulai. The last round just pauses."""
+    if not match or match.get("status") not in ("in_progress", "paused"):
         return match
-    timer = match.get("timer") or {}
-    if not timer.get("running") or not timer.get("started_at"):
-        return match
+    timer = dict(match.get("timer") or {})
+    phase = timer.get("phase") or "round"
     now = datetime.now(timezone.utc)
-    try:
-        started = datetime.fromisoformat(timer["started_at"])
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-    except Exception:
+    remaining = float(timer.get("remaining_sec") or 0)
+    started_at = timer.get("started_at")
+    running = bool(timer.get("running") and started_at)
+    if running:
+        try:
+            started = datetime.fromisoformat(started_at)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except Exception:
+            return match
+        remaining = remaining - (now - started).total_seconds()
+        if remaining > 0:
+            return match
+    elif phase == "rest" or remaining > 0 or match.get("status") != "paused" or not match.get("started_at"):
         return match
-    remaining = float(timer.get("remaining_sec") or 0) - (now - started).total_seconds()
-    if remaining > 0:
+
+    rule = await db.scoring_rules.find_one({"id": match.get("scoring_rule_id")}) or {}
+    round_duration = _match_round_duration(match, rule)
+    round_no = _safe_int(timer.get("round") or match.get("current_round"), 1)
+    cur = _safe_int(match.get("current_round"), round_no or 1)
+
+    if phase == "rest":
+        return await _save_clock(match, _parked_round_timer(round_no, round_duration), {"status": "paused"})
+
+    total = _round_count(rule)
+    if cur < total:
+        nxt = cur + 1
+        rest = _rest_seconds(rule)
+        if rest > 0:
+            return await _save_clock(
+                match,
+                _running_rest_timer(nxt, rest, now),
+                {"current_round": nxt, "status": "in_progress"},
+            )
+        return await _save_clock(
+            match,
+            _parked_round_timer(nxt, round_duration),
+            {"current_round": nxt, "status": "paused"},
+        )
+
+    if match.get("status") == "paused" and not running:
         return match
     stopped = {
         "running": False,
         "remaining_sec": 0,
         "started_at": None,
-        "round": timer.get("round", match.get("current_round", 1)),
-        "phase": timer.get("phase") or "round",
+        "round": cur,
+        "phase": "round",
     }
-    await db.matches.update_one({"id": match["id"]}, {"$set": {"timer": stopped, "status": "paused"}})
-    updated = dict(match)
-    updated["timer"] = stopped
-    updated["status"] = "paused"
-    return updated
+    return await _save_clock(match, stopped, {"status": "paused"})
 
 
 async def _expire_running_matches_loop():
@@ -616,7 +711,7 @@ async def _expire_running_matches_loop():
             matches = await db.matches.find({"status": "in_progress", "timer.running": True}).to_list(200)
             for match in matches:
                 updated = await settle_expired_timer(match)
-                if updated.get("status") != match.get("status"):
+                if _clock_moved(match, updated):
                     await broadcast_match_update(match["id"], "timer_update")
         except Exception as e:
             logger.warning("timer expire loop: %s", e)
@@ -628,7 +723,7 @@ async def _load_match_settled(mid: str) -> Optional[Dict[str, Any]]:
     if not match:
         return None
     updated = await settle_expired_timer(match)
-    if updated.get("status") != match.get("status"):
+    if _clock_moved(match, updated):
         await broadcast_match_update(mid, "timer_update")
     return updated
 
@@ -2522,7 +2617,7 @@ async def add_action(mid: str, data: ScoreActionIn, user=Depends(require_roles("
         raise HTTPException(400, "Sedang istirahat. Mulai ronde berikutnya sebelum menambah skor.")
     clock_done = not timer.get("running") and float(timer.get("remaining_sec") or 0) <= 0
     if data.action_type == "score" and clock_done:
-        raise HTTPException(400, "Waktu ronde habis. Mulai ronde lagi atau akhiri partai sebelum menambah skor.")
+        raise HTTPException(400, "Waktu ronde habis. Skor tidak dapat ditambah.")
 
     rule = await db.scoring_rules.find_one({"id": match["scoring_rule_id"]}) or {}
     points = _action_points(data, rule)
@@ -2607,21 +2702,30 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
         raise HTTPException(404, "Match tidak ditemukan")
     if match.get("status") in ("approved", "finished"):
         raise HTTPException(400, "Partai yang sudah selesai atau disahkan sudah dikunci")
+    before_phase = (match.get("timer") or {}).get("phase")
+    before_round = match.get("current_round")
     match = await settle_expired_timer(match)
     rule = await db.scoring_rules.find_one({"id": match["scoring_rule_id"]}) or {}
     round_duration = _match_round_duration(match, rule)
-    total_rounds = rule.get("round_count", 3)
-
-    timer = match.get("timer", {"running": False, "remaining_sec": round_duration, "round": 1, "started_at": None})
+    total_rounds = _round_count(rule)
+    timer = dict(match.get("timer") or {
+        "running": False, "remaining_sec": round_duration, "round": 1, "started_at": None, "phase": "round",
+    })
+    settled_forward = (timer.get("phase") or "round") != (before_phase or "round") or match.get("current_round") != before_round
     now = datetime.now(timezone.utc)
 
     def consume_running():
         nonlocal timer
         timer = _consume_timer(timer, now)
 
-    update = {}
-    if data.action == "start":
-        if (timer.get("phase") or "round") == "rest":
+    def begin_clock():
+        """Start the clock that is already on screen. A finished round is never refilled."""
+        nonlocal timer
+        phase = timer.get("phase") or "round"
+        remaining = float(timer.get("remaining_sec") or 0)
+        if phase == "rest" and timer.get("running"):
+            return
+        if phase == "rest" and remaining <= 0:
             timer = {
                 "running": True,
                 "remaining_sec": round_duration,
@@ -2629,26 +2733,35 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
                 "round": timer.get("round", match.get("current_round", 1)),
                 "phase": "round",
             }
-        elif not timer.get("running"):
-            if timer.get("remaining_sec", 0) <= 0:
-                timer["remaining_sec"] = round_duration
+            return
+        if phase == "rest":
             timer["running"] = True
             timer["started_at"] = now.isoformat()
-            timer["phase"] = timer.get("phase") or "round"
+            timer["phase"] = "rest"
+            return
+        if timer.get("running"):
+            return
+        if remaining <= 0 and match.get("started_at"):
+            raise HTTPException(400, "Waktu ronde sudah habis. Ronde ini tidak diulang.")
+        if remaining <= 0:
+            timer["remaining_sec"] = round_duration
+        timer["running"] = True
+        timer["started_at"] = now.isoformat()
+        timer["phase"] = "round"
+
+    update = {}
+    if data.action in ("start", "resume"):
+        begin_clock()
         update["status"] = "in_progress"
         if not match.get("started_at"):
             update["started_at"] = now.isoformat()
     elif data.action == "pause":
-        consume_running()
-        update["status"] = "paused"
-    elif data.action == "resume":
-        if not timer.get("running"):
-            timer["running"] = True
-            timer["started_at"] = now.isoformat()
-        update["status"] = "in_progress"
+        if not settled_forward:
+            consume_running()
+            update["status"] = "paused"
     elif data.action == "reset":
         phase = timer.get("phase") or "round"
-        duration = int(rule.get("rest_duration_sec") or 0) if phase == "rest" else round_duration
+        duration = _rest_seconds(rule) if phase == "rest" else round_duration
         timer = {
             "running": False,
             "remaining_sec": duration,
@@ -2657,35 +2770,26 @@ async def timer_action(mid: str, data: TimerActionIn, user=Depends(require_roles
             "phase": phase,
         }
     elif data.action == "next_round":
-        consume_running()
-        cur = match.get("current_round", 1)
-        if cur < total_rounds:
-            cur += 1
-            try:
-                rest = int(rule.get("rest_duration_sec") or 0)
-            except (TypeError, ValueError):
-                rest = 0
-            if rest > 0:
-                timer = {
-                    "running": False,
-                    "remaining_sec": rest,
-                    "round": cur,
-                    "started_at": None,
-                    "phase": "rest",
-                }
+        if not settled_forward:
+            consume_running()
+            phase = timer.get("phase") or "round"
+            cur = _safe_int(match.get("current_round"), 1)
+            if phase == "rest":
+                timer = _parked_round_timer(cur, round_duration)
+                update["status"] = "paused"
+            elif cur < total_rounds:
+                nxt = cur + 1
+                rest = _rest_seconds(rule)
+                if rest > 0:
+                    timer = _running_rest_timer(nxt, rest, now)
+                    update["status"] = "in_progress"
+                else:
+                    timer = _parked_round_timer(nxt, round_duration)
+                    update["status"] = "paused"
+                update["current_round"] = nxt
             else:
-                timer = {
-                    "running": False,
-                    "remaining_sec": round_duration,
-                    "round": cur,
-                    "started_at": None,
-                    "phase": "round",
-                }
-            update["current_round"] = cur
-            update["status"] = "paused"
-        else:
-            update["status"] = "finished"
-            update["finished_at"] = now.isoformat()
+                update["status"] = "finished"
+                update["finished_at"] = now.isoformat()
     elif data.action == "end_match":
         consume_running()
         update["status"] = "finished"

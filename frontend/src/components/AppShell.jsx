@@ -84,7 +84,7 @@ export default function AppShell({ children, title }) {
               size="sm"
               onClick={() => { logout(); navigate("/login"); }}
               data-testid="logout-btn"
-              className="text-zinc-400 hover:text-white hover:bg-white/5"
+              className="hidden xl:inline-flex text-zinc-400 hover:text-white hover:bg-white/5"
             >
               <LogOut className="w-4 h-4" />
             </Button>
@@ -97,14 +97,14 @@ export default function AppShell({ children, title }) {
         </div>
       )}
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
-        <SheetContent side="right" className="bg-[#0a0a0a] text-white border-white/10 w-[min(20rem,88vw)] p-0">
+        <SheetContent side="right" style={{ left: "auto", right: 0 }} className="bg-[#0a0a0a] text-white border-white/10 left-auto right-0 flex h-full w-[min(18rem,78vw)] flex-col p-0">
           <SheetHeader className="px-5 pt-6 pb-4 pr-12 border-b border-white/10 text-left space-y-1">
             <SheetTitle className="font-display text-2xl tracking-tight uppercase text-white">Menu</SheetTitle>
             <SheetDescription className="text-zinc-400">
               {user?.name} · {ROLE_LABEL[user?.role] || user?.role}
             </SheetDescription>
           </SheetHeader>
-          <nav className="flex flex-col p-3 gap-1">
+          <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3">
             {visibleNav.map((n) => {
               const Icon = n.icon;
               const active = n.to === "/admin" ? location.pathname === "/admin" : location.pathname.startsWith(n.to);
@@ -123,6 +123,16 @@ export default function AppShell({ children, title }) {
               );
             })}
           </nav>
+          <div className="mt-auto border-t border-white/10 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+            <button
+              type="button"
+              data-testid="logout-btn-mobile"
+              onClick={() => { setMenuOpen(false); logout(); navigate("/login"); }}
+              className="flex w-full items-center gap-3 rounded-sm px-3 py-3 text-sm uppercase tracking-[0.14em] text-zinc-300 hover:bg-white/5 hover:text-white"
+            >
+              <LogOut className="h-4 w-4" /> Keluar
+            </button>
+          </div>
         </SheetContent>
       </Sheet>
       <main className={`max-w-[1600px] mx-auto px-4 sm:px-6 ${title ? "pt-4 pb-6" : "py-6"}`}>{children}</main>

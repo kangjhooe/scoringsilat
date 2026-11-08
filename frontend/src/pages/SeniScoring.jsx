@@ -44,7 +44,11 @@ export default function SeniScoring() {
 
   useEffect(() => {
     const ws = openMatchSocket(mid, () => load());
-    return () => ws?.close?.();
+    const poll = setInterval(load, 1000);
+    return () => {
+      clearInterval(poll);
+      ws?.close?.();
+    };
   }, [mid, load]);
   /* eslint-enable */
 

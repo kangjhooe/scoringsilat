@@ -16,20 +16,75 @@ function formatPoints(value) {
   return Number(value || 0).toFixed(2);
 }
 
+function emptySeni(matchId) {
+  return {
+    match: { id: matchId },
+    athletes: [],
+    scores: [],
+    penalties: [],
+    final_score: 0,
+    average: 0,
+    total_penalty: 0,
+    jury_count: 0,
+  };
+}
+
 function reloadPublicSeni(matchId, setSeni) {
   if (!matchId) return;
   api.get(`/public/matches/${matchId}/seni`).then((r) => setSeni(r.data)).catch(() => {
-    setSeni({
-      match: { id: matchId },
-      athletes: [],
-      scores: [],
-      penalties: [],
-      final_score: 0,
-      average: 0,
-      total_penalty: 0,
-      jury_count: 0,
-    });
+    setSeni(emptySeni(matchId));
   });
+}
+
+function createLive(onMatch) {
+  let requestSeq = 0;
+  let appliedSeq = 0;
+  const gone = { current: false };
+  return {
+    gone,
+    token() {
+      return appliedSeq;
+    },
+    push(next) {
+      if (!next?.id || gone.current) return appliedSeq;
+      requestSeq += 1;
+      appliedSeq = requestSeq;
+      onMatch(next);
+      return appliedSeq;
+    },
+    begin() {
+      requestSeq += 1;
+      return requestSeq;
+    },
+    accept(seq, next) {
+      if (gone.current || seq < appliedSeq || !next?.id) return false;
+      appliedSeq = seq;
+      onMatch(next);
+      return true;
+    },
+    fresh(seq) {
+      return !gone.current && seq >= appliedSeq;
+    },
+  };
+}
+
+function loadSeni(matchId, live, seq, setSeni) {
+  api.get(`/public/matches/${matchId}/seni`).then((r) => {
+    if (live.fresh(seq)) setSeni(r.data);
+  }).catch(() => {
+    if (live.fresh(seq)) setSeni(emptySeni(matchId));
+  });
+}
+
+function applyLiveMessage(msg, live, setSeni) {
+  if (typeof msg?.type === "string" && msg.type.startsWith("seni_")) {
+    const token = msg.state ? live.push(msg.state) : live.token();
+    const id = msg.match_id || msg.state?.id;
+    if (!id) return;
+    loadSeni(id, live, token, setSeni);
+    return;
+  }
+  if (msg?.state) live.push(msg.state);
 }
 
 const SENI_LABEL = { tunggal: "Tunggal", ganda: "Ganda", regu: "Regu" };
@@ -134,18 +189,26 @@ export function PublicArenaDisplay() {
   const [arenaName, setArenaName] = useState("");
 
   useEffect(() => {
-    api.get(`/public/arenas/${arenaId}/current`).then((r) => {
-      if (r.data.match) { setState(r.data.match); setMatchId(r.data.match.id); }
+    const live = createLive((next) => {
+      setState(next);
+      setMatchId(next.id);
     });
-    const sock = openArenaSocket(arenaId, (msg) => {
-      if (typeof msg?.type === "string" && msg.type.startsWith("seni_")) {
-        if (msg.state) { setState(msg.state); setMatchId(msg.match_id); }
-        reloadPublicSeni(msg.match_id, setSeni);
-        return;
-      }
-      if (msg?.state) { setState(msg.state); setMatchId(msg.match_id); }
-    });
-    return () => sock.close();
+    const pull = () => {
+      const seq = live.begin();
+      api.get(`/public/arenas/${arenaId}/current`).then((r) => {
+        const match = r.data.match;
+        if (!live.accept(seq, match)) return;
+        if (isSeniDiscipline(match.discipline)) loadSeni(match.id, live, seq, setSeni);
+      }).catch(() => {});
+    };
+    pull();
+    const poll = setInterval(pull, 1000);
+    const sock = openArenaSocket(arenaId, (msg) => applyLiveMessage(msg, live, setSeni));
+    return () => {
+      live.gone.current = true;
+      clearInterval(poll);
+      sock.close();
+    };
   }, [arenaId]);
 
   useEffect(() => {
@@ -197,16 +260,22 @@ export function PublicMatchDisplay() {
   const [athletes, setAthletes] = useState({});
 
   useEffect(() => {
-    api.get(`/public/matches/${matchId}`).then((r) => setState(r.data));
-    const sock = openPublicMatchSocket(matchId, (msg) => {
-      if (typeof msg?.type === "string" && msg.type.startsWith("seni_")) {
-        if (msg.state) setState(msg.state);
-        reloadPublicSeni(msg.match_id || matchId, setSeni);
-        return;
-      }
-      if (msg?.state) setState(msg.state);
-    });
-    return () => sock.close();
+    const live = createLive((next) => setState(next));
+    const pull = () => {
+      const seq = live.begin();
+      api.get(`/public/matches/${matchId}`).then((r) => {
+        if (!live.accept(seq, r.data)) return;
+        if (isSeniDiscipline(r.data?.discipline)) loadSeni(matchId, live, seq, setSeni);
+      }).catch(() => {});
+    };
+    pull();
+    const poll = setInterval(pull, 1000);
+    const sock = openPublicMatchSocket(matchId, (msg) => applyLiveMessage(msg, live, setSeni));
+    return () => {
+      live.gone.current = true;
+      clearInterval(poll);
+      sock.close();
+    };
   }, [matchId]);
 
   useEffect(() => {

@@ -18,25 +18,59 @@ import AthleteAvatar, { ActionIcon, actionLabel } from "@/components/AthleteAvat
 function useMatchState(matchId) {
   const [state, setState] = useState(null);
   const [loading, setLoading] = useState(true);
+  const requestSeq = useRef(0);
+  const appliedSeq = useRef(0);
+
+  const applyState = (next) => {
+    if (!next?.id) return;
+    requestSeq.current += 1;
+    appliedSeq.current = requestSeq.current;
+    setState(next);
+  };
+
+  const takeRead = (seq, next) => {
+    if (!next?.id || seq < appliedSeq.current) return false;
+    appliedSeq.current = seq;
+    setState(next);
+    return true;
+  };
 
   const refresh = async () => {
+    const seq = ++requestSeq.current;
     try {
       const r = await api.get(`/matches/${matchId}`);
-      setState(r.data);
+      takeRead(seq, r.data);
     } catch (e) {
       // ignore
     } finally { setLoading(false); }
   };
 
   useEffect(() => {
-    refresh();
+    let gone = false;
+    const pull = async () => {
+      const seq = ++requestSeq.current;
+      try {
+        const r = await api.get(`/matches/${matchId}`);
+        if (!gone) takeRead(seq, r.data);
+      } catch (e) {
+        // ignore
+      } finally {
+        if (!gone) setLoading(false);
+      }
+    };
+    pull();
     const sock = openMatchSocket(matchId, (msg) => {
-      if (msg?.state) setState(msg.state);
+      if (msg?.state) applyState(msg.state);
     });
-    return () => sock.close();
+    const poll = setInterval(pull, 1000);
+    return () => {
+      gone = true;
+      clearInterval(poll);
+      sock.close();
+    };
   }, [matchId]);
 
-  return { state, loading, refresh };
+  return { state, loading, refresh, applyState };
 }
 
 function useTicker(running) {
@@ -85,7 +119,7 @@ export default function MatchControl() {
   const { matchId } = useParams();
   const { user } = useAuth();
   const nav = useNavigate();
-  const { state, loading, refresh } = useMatchState(matchId);
+  const { state, loading, refresh, applyState } = useMatchState(matchId);
   const athletes = useAthletes(state?.event_id);
 
   if (loading) return <AppShell title="Memuat..."><div className="text-zinc-400">Memuat data partai...</div></AppShell>;
@@ -118,7 +152,7 @@ export default function MatchControl() {
         </TabsList>
         <TabsContent value="jury" className="mt-6"><JuryPanel state={state} role={role} refresh={refresh} red={red} blue={blue}/></TabsContent>
         <TabsContent value="referee" className="mt-6"><RefereePanel state={state} role={role} refresh={refresh}/></TabsContent>
-        <TabsContent value="timer" className="mt-6"><TimerPanel state={state} role={role} refresh={refresh}/></TabsContent>
+        <TabsContent value="timer" className="mt-6"><TimerPanel state={state} role={role} applyState={applyState}/></TabsContent>
         <TabsContent value="head" className="mt-6"><HeadJuryPanel state={state} role={role} refresh={refresh} red={red} blue={blue}/></TabsContent>
         <TabsContent value="logs" className="mt-6"><LogsPanel matchId={matchId} role={role} onChanged={refresh}/></TabsContent>
       </Tabs>
@@ -219,6 +253,7 @@ function JuryPanel({ state, role, refresh, red, blue }) {
       const r = await api.post(`/matches/${state.id}/actions`, { corner, action_type: "score", code, points: pts });
       if (r.data?.pending) toast("Menunggu juri lain");
       else toast.success("Poin masuk");
+      await refresh();
     } catch (e) { toast.error(formatApiError(e)); }
   };
 
@@ -298,6 +333,7 @@ function RefereePanel({ state, role, refresh }) {
     try {
       await api.post(`/matches/${state.id}/actions`, { corner, action_type, code });
       toast.success(`${action_type} ${code} → ${corner}`);
+      await refresh();
     } catch (e) { toast.error(formatApiError(e)); }
   };
 
@@ -344,13 +380,15 @@ function RefereePanel({ state, role, refresh }) {
 }
 
 // ============ Timer Panel ============
-function TimerPanel({ state, role, refresh }) {
+function TimerPanel({ state, role, applyState }) {
   const can = role === "timer" || role === "operator" || role === "admin";
   const locked = state.status === "approved" || state.status === "finished";
   const send = async (action) => {
     if (locked) return;
-    try { await api.post(`/matches/${state.id}/timer`, { action }); }
-    catch (e) { toast.error(formatApiError(e)); }
+    try {
+      const r = await api.post(`/matches/${state.id}/timer`, { action });
+      if (r.data?.timer) applyState(r.data);
+    } catch (e) { toast.error(formatApiError(e)); }
   };
   const remaining = computeRemaining(state.timer);
   useTicker(state.timer?.running);
@@ -358,18 +396,24 @@ function TimerPanel({ state, role, refresh }) {
   if (!can) return <NoticeBox text="Hanya Timer/Operator yang dapat mengontrol timer." />;
 
   const running = state.timer?.running;
+  const resting = state.timer?.phase === "rest";
+  const lastRound = state.current_round >= (state.rule?.round_count || 3);
+  const roundSpent = !resting && !running && remaining <= 0 && !!state.started_at && lastRound;
+  const restRunning = resting && running;
   const timerBtn = "tap-press h-20 sm:h-24 rounded-sm font-bold uppercase tracking-[0.08em] whitespace-normal text-center px-2 disabled:cursor-not-allowed";
   return (
     <div className="grid grid-cols-12 gap-6">
       <div className="col-span-12 md:col-span-6 border border-white/10 rounded-sm bg-[#141414] p-8 text-center">
-        <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400" data-testid="timer-phase-label">{state.timer?.phase === "rest" ? "Istirahat" : "Sisa Waktu Ronde"}</div>
+        <div className="text-[10px] tracking-[0.3em] uppercase text-zinc-400" data-testid="timer-phase-label">{resting ? "Istirahat" : "Sisa Waktu Ronde"}</div>
         <div className={`font-mono-display text-7xl md:text-8xl xl:text-9xl tracking-tighter mt-2 ${running ? "text-[#ffcc00]" : "text-white"}`} data-testid="timer-remaining">{fmtTime(remaining)}</div>
         <div className="text-sm text-zinc-500 mt-2">Ronde {state.current_round} / {state.rule?.round_count || 3}</div>
       </div>
       <div className="col-span-12 md:col-span-6 flex flex-col gap-3">
         {locked && <div data-testid="timer-locked-notice"><NoticeBox text="Partai sudah dikunci." /></div>}
+        {restRunning && <NoticeBox text="Istirahat berjalan sendiri. Setelah habis, layar menampilkan waktu ronde berikutnya. Tekan Mulai untuk memulai ronde itu." />}
+        {roundSpent && <NoticeBox text="Waktu ronde terakhir habis. Mulai tidak mengulang ronde ini. Akhiri partai untuk menutup." />}
         <div className="grid grid-cols-2 gap-3">
-          <Button disabled={locked} onClick={() => send("start")} data-testid="timer-start" className={`${timerBtn} bg-[#10b981] hover:bg-[#0ea271] text-white`}>
+          <Button disabled={locked || roundSpent || restRunning} onClick={() => send("start")} data-testid="timer-start" className={`${timerBtn} bg-[#10b981] hover:bg-[#0ea271] text-white`}>
             <Play className="w-5 h-5 mr-2"/> Mulai
           </Button>
           <Button disabled={locked} onClick={() => send("pause")} data-testid="timer-pause" className={`${timerBtn} bg-[#ffcc00] hover:bg-[#e6b800] text-black`}>
